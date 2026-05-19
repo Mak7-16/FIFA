@@ -3,6 +3,87 @@ const { Telegraf, Markup } = require('telegraf');
 
 const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
 
+/** Реалістична поведінка: typing + затримка, варіації відповіді, рідкі опечатки */
+function _computeTypingDelay(text) {
+  const len = String(text || '').length;
+  const perChar = 35 + Math.random() * 70; // ms per visible char
+  const base = 200 + Math.random() * 600; // base thinking time
+  const jitter = (Math.random() - 0.5) * 300; // +/- jitter
+  const delay = Math.min(9000, Math.max(100, Math.round(base + perChar * len + jitter)));
+  return delay;
+}
+
+function _makeTypoOnce(text) {
+  if (!text || text.length < 6) return text;
+  const i = Math.floor(Math.random() * (text.length - 1));
+  const arr = text.split('');
+  // swap adjacent characters
+  const tmp = arr[i];
+  arr[i] = arr[i + 1];
+  arr[i + 1] = tmp;
+  return arr.join('');
+}
+
+bot.use(async (ctx, next) => {
+  if (!ctx || ctx._realismInstalled) return next();
+  ctx._realismInstalled = true;
+  const origReply = ctx.reply.bind(ctx);
+
+  ctx.reply = async (text, extra) => {
+    try {
+      const chatId = ctx.chat?.id || ctx.from?.id;
+      if (chatId) {
+        // send typing action (best-effort)
+        try {
+          await ctx.telegram.sendChatAction(chatId, 'typing');
+        } catch (e) {
+          // ignore
+        }
+        const delay = _computeTypingDelay(text);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+
+      // small chance to simulate a quick typo then edit
+      const typoChance = 0.08; // 8%
+      if (Math.random() < typoChance && typeof text === 'string' && text.length > 6) {
+        const typo = _makeTypoOnce(text);
+        let sent = null;
+        try {
+          sent = await origReply(typo, extra);
+        } catch (e) {
+          // fallback to normal send
+          return origReply(text, extra);
+        }
+        // short pause then edit
+        const editDelay = Math.min(1200 + Math.random() * 1200, 3000);
+        await new Promise((r) => setTimeout(r, editDelay));
+        try {
+          const chatId = ctx.chat?.id || ctx.from?.id;
+          if (sent?.message_id && chatId) {
+            await ctx.telegram.callApi('editMessageText', {
+              chat_id: chatId,
+              message_id: sent.message_id,
+              text,
+              ...(extra?.parse_mode ? { parse_mode: extra.parse_mode } : {}),
+              ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+            });
+            return;
+          }
+        } catch (e) {
+          // if edit failed, send the correct text as a new message
+          return origReply(text, extra);
+        }
+      }
+
+      return origReply(text, extra);
+    } catch (e) {
+      return origReply(text, extra);
+    }
+  };
+
+  return next();
+});
+
 /** Хто писав боту — для /list і розсилки /write (скидається при перезапуску). */
 /** @type {Map<number, { username: string | null; first_name: string }>} */
 const knownUsersById = new Map();
