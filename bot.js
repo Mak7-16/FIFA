@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Telegraf, Markup, Input } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 
 const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
 
@@ -236,57 +236,115 @@ bot.on('contact', async (ctx) => {
   );
 });
 
-/**
- * Посилання для завантаження фото НАМИ (не через Telegram URL).
- * Сервери Telegram часто не можуть підтягнути Wikimedia → "failed to get HTTP URL content".
- */
-const MATCH_IMAGE_URLS = [
-  'https://upload.wikimedia.org/wikipedia/commons/thumb/8/8d/Football_iu_1996.jpg/960px-Football_iu_1996.jpg',
-  'https://upload.wikimedia.org/wikipedia/commons/8/8d/Football_iu_1996.jpg',
-  'https://upload.wikimedia.org/wikipedia/commons/thumb/6/6e/Football_%28soccer_ball%29.svg/512px-Football_%28soccer_ball%29.svg.png',
-];
-
-/** @type {ReturnType<typeof Input.fromBuffer> | null} */
-let cachedMatchPhoto = null;
-
-async function getMatchPhotoInput() {
-  if (cachedMatchPhoto) return cachedMatchPhoto;
-  for (const url of MATCH_IMAGE_URLS) {
+/** Повтор запиту при 429 (retry_after у секундах). Ігнор «message is not modified». */
+async function telegramSendOrRetry(fn) {
+  const maxAttempts = 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': 'FifaTelegramBot/1.0 (Node)' },
-      });
-      if (!res.ok) continue;
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length < 200) continue;
-      const filename = url.toLowerCase().includes('.png') ? 'match.png' : 'match.jpg';
-      cachedMatchPhoto = Input.fromBuffer(buf, filename);
-      return cachedMatchPhoto;
-    } catch {
-      // наступний URL
+      return await fn();
+    } catch (e) {
+      const desc = String(e?.response?.description || '');
+      if (desc.includes('message is not modified')) return null;
+      const code = e?.response?.error_code;
+      const waitSec = e?.response?.parameters?.retry_after ?? e?.parameters?.retry_after;
+      if (code === 429 && typeof waitSec === 'number') {
+        await new Promise((r) => setTimeout(r, (waitSec + 1) * 1000));
+        continue;
+      }
+      throw e;
     }
   }
-  return null;
+  throw new Error('Telegram API: занадто багато спроб після 429');
 }
 
-/** Надсилає фото як файл (Telegram не робить HTTP до зовнішнього URL). */
-async function replyWithMatchPhoto(ctx, extra) {
-  const photo = await getMatchPhotoInput();
-  if (photo) {
-    await ctx.replyWithPhoto(photo, extra);
-    return;
+function replyMarkupFromExtra(extra) {
+  return extra?.reply_markup;
+}
+
+async function postSoloMatchLiveBoard(ctx, state, extra) {
+  const telegram = ctx.telegram;
+  const chatId = ctx.chat.id;
+  /** Текст (до 4096), без GIF — інакше Telegram часто дає 429 на sendAnimation. */
+  const text = String(extra.caption || '').slice(0, 4096);
+  const parse_mode = extra.parse_mode;
+  const reply_markup = replyMarkupFromExtra(extra);
+
+  const mid = state.liveAnimMessageId;
+  if (mid) {
+    try {
+      await telegramSendOrRetry(() =>
+        telegram.callApi('editMessageText', {
+          chat_id: chatId,
+          message_id: mid,
+          text,
+          ...(parse_mode ? { parse_mode } : {}),
+          ...(reply_markup ? { reply_markup } : {}),
+        })
+      );
+      return;
+    } catch (e) {
+      const d = String(e?.response?.description || '');
+      if (d.includes('message is not modified')) return;
+      console.warn('editMessageText (матч)', d);
+      state.liveAnimMessageId = null;
+    }
   }
-  const caption = extra.caption || '';
-  await ctx.reply(`${caption}\n\n(Не вдалося завантажити картинку — перевір інтернет і спробуй ще.)`, {
-    reply_markup: extra.reply_markup,
-  });
+
+  const sent = await telegramSendOrRetry(() =>
+    telegram.sendMessage(chatId, text, {
+      ...(parse_mode ? { parse_mode } : {}),
+      ...(reply_markup ? { reply_markup } : {}),
+    })
+  );
+  if (sent?.message_id) state.liveAnimMessageId = sent.message_id;
 }
 
-/** @type {Map<number, { you: number; them: number; turn: number; maxTurns: number; possession: 'you' | 'them' }>} */
+function pvpInlineKbOrEmpty(keyboardExtra) {
+  const rows = keyboardExtra?.reply_markup?.inline_keyboard;
+  if (rows && rows.length) return keyboardExtra.reply_markup;
+  return { inline_keyboard: [] };
+}
+
+async function postPvpMatchLiveBoard(telegram, session, playerId, captionHtml, keyboardExtra) {
+  const reply_markup = pvpInlineKbOrEmpty(keyboardExtra);
+  const text = captionHtml.slice(0, 4096);
+  const mid = session.liveAnimMsgByPlayer.get(playerId);
+  if (mid) {
+    try {
+      await telegramSendOrRetry(() =>
+        telegram.callApi('editMessageText', {
+          chat_id: playerId,
+          message_id: mid,
+          text,
+          parse_mode: 'HTML',
+          reply_markup,
+        })
+      );
+      return;
+    } catch (e) {
+      const d = String(e?.response?.description || '');
+      if (d.includes('message is not modified')) return;
+      console.warn('editMessageText (PvP)', d);
+      session.liveAnimMsgByPlayer.delete(playerId);
+    }
+  }
+  const sent = await telegramSendOrRetry(() =>
+    telegram.sendMessage(playerId, text, {
+      parse_mode: 'HTML',
+      reply_markup,
+    })
+  );
+  if (sent?.message_id) session.liveAnimMsgByPlayer.set(playerId, sent.message_id);
+}
+
+/**
+ * Табло матчу: `liveAnimMessageId` — id текстового повідомлення в чаті (оновлення через editMessageText).
+ * @type {Map<number, { you: number; them: number; turn: number; maxTurns: number; possession: 'you' | 'them'; liveAnimMessageId: number | null; tournament?: object | null; league?: object | null; playerSeason?: object | null }>}
+ */
 const fifaMatchByUser = new Map();
 
 /** PvP: два гравці по черзі в одному матчі. */
-/** @type {Map<string, { sessionId: string; playerIds: [number, number]; scores: [number, number]; currentIdx: 0 | 1; moveNum: number; maxTurns: number; possession: 'you' | 'them' }>} */
+/** @type {Map<string, { sessionId: string; playerIds: [number, number]; scores: [number, number]; currentIdx: 0 | 1; moveNum: number; maxTurns: number; possession: 'you' | 'them'; liveAnimMsgByPlayer: Map<number, number> }>} */
 const pvpSessions = new Map();
 /** userId → sessionId */
 const pvpUserToSession = new Map();
@@ -337,7 +395,696 @@ const LEAGUE_OPPONENTS = [
   { key: 'g9', name: '«Динамо» (молодь)', strength: 0.115 },
 ];
 
+/** Збірні для симуляції чемпіонату світу в кар'єрі гравця. */
+const CAREER_WORLD_OPPONENTS = [
+  { key: 'w1', name: 'збірна Бразилії' },
+  { key: 'w2', name: 'збірна Аргентини' },
+  { key: 'w3', name: 'збірна Франції' },
+  { key: 'w4', name: 'збірна Німеччини' },
+  { key: 'w5', name: 'збірна Іспанії' },
+  { key: 'w6', name: 'збірна Англії' },
+  { key: 'w7', name: 'збірна Португалії' },
+  { key: 'w8', name: 'збірна Нідерландів' },
+  { key: 'w9', name: 'збірна Італії' },
+  { key: 'w10', name: 'збірна Хорватії' },
+  { key: 'w11', name: 'збірна Бельгії' },
+  { key: 'w12', name: 'збірна України' },
+  { key: 'w13', name: 'збірна Польщі' },
+  { key: 'w14', name: 'збірна Колумбії' },
+  { key: 'w15', name: 'збірна Японії' },
+];
+
+/** Разові завдання кар'єри гравця — перевірка після підсумку сезону; нагорода при натисканні «Наступний сезон». */
+const CAREER_QUEST_DEFS = [
+  { id: 'cq_wc_win', label: 'Виграй Чемпіонат світу хоча б раз', rewardCoins: 200 },
+  { id: 'cq_league_3', label: 'Стань чемпіоном ліги 3 рази', rewardCoins: 170 },
+  { id: 'cq_triple_once', label: 'За один сезон: чемпіон ліги + кубок + єврокубок', rewardCoins: 240 },
+  { id: 'cq_golden_3', label: 'Отримай 3 Золоті м’ячі за кар’єру', rewardCoins: 300 },
+  { id: 'cq_euro_2', label: 'Виграй єврокубок 2 рази', rewardCoins: 150 },
+  { id: 'cq_ovr93', label: 'Досягни 93+ OVR', rewardCoins: 140 },
+];
+
 const LEAGUE_POS_BONUS = [200, 130, 90, 65, 50, 40, 32, 25, 18, 12];
+
+/** Режим кар'єри: club — ліга; player — кар'єра ікони; coach — офіс тренера; agent — агент (таланти). */
+/** @type {Map<number, 'club' | 'player' | 'coach' | 'agent'>} */
+const careerModeByUser = new Map();
+
+/** Режим тренера: тактика й стан команди дають бонус у товариських матчах і кубку. */
+/** @type {Map<number, { tactic: 'attack' | 'balance' | 'defense'; morale: number; fatigue: number; drillKind: 'tactical' | 'technical' | 'pressing' | 'passes' | 'finishing' | 'setpieces' | null; drillMatchesLeft: number; subsFresh: boolean }>} */
+const coachStateByUser = new Map();
+
+/** Сильніший бонус до ease (~2 матчі після тренування). */
+const COACH_DRILL_STRONG = new Set(['tactical', 'pressing', 'setpieces']);
+/** Середній бонус до ease. */
+const COACH_DRILL_WEAK = new Set(['technical', 'passes', 'finishing']);
+
+function coachDrillKindValid(k) {
+  return Boolean(k && (COACH_DRILL_STRONG.has(k) || COACH_DRILL_WEAK.has(k)));
+}
+
+/** Режим агента: розвідка талантів, продаж контрактів, репутація (легкість у товариських / турнірі). */
+/** @type {Map<number, { reputation: number; prospects: { first: string; last: string; ovr: number; potential: string }[] }>} */
+const agentStateByUser = new Map();
+
+const AGENT_ROSTER_MAX = 5;
+const AGENT_FIRST_NAMES = [
+  'Данііл',
+  'Марко',
+  'Тарас',
+  'Орест',
+  'Адам',
+  'Лукʼян',
+  'Назар',
+  'Богдан',
+  'Тимофій',
+  'Ярослав',
+];
+const AGENT_LAST_NAMES = [
+  'Шевченко',
+  'Бойко',
+  'Коваленко',
+  'Гриценко',
+  'Лисенко',
+  'Мельник',
+  'Бондар',
+  'Олійник',
+  'Ткаченко',
+  'Романюк',
+];
+
+function getAgentState(userId) {
+  if (!agentStateByUser.has(userId)) {
+    agentStateByUser.set(userId, { reputation: 52, prospects: [] });
+  }
+  const a = agentStateByUser.get(userId);
+  if (a.reputation == null || a.reputation < 1) a.reputation = 52;
+  if (!Array.isArray(a.prospects)) a.prospects = [];
+  return a;
+}
+
+/** Ймовірність «порожньої» розвідки: при високій репутації падає помітно сильніше. */
+function agentScoutFailChance(rep) {
+  const r = Math.min(100, Math.max(25, rep));
+  return Math.max(0.17, Math.min(0.58, 0.615 - (r - 52) * 0.0072));
+}
+
+/** Короткий опис рівня — щоб репутація була зрозумілою в офісі. */
+function agentReputationTierTitle(rep) {
+  const x = Math.min(100, Math.max(25, rep));
+  if (x >= 86) return '⭐ Елітний агент';
+  if (x >= 72) return '📈 Імʼя на ринку';
+  if (x >= 58) return '🎯 Помічений клубами';
+  if (x >= 44) return '📋 Працюєш по базі';
+  return '⚠️ Новачок у бізнесі';
+}
+
+/** Якщо не null — знайдено таланта (після успішної перевірки). */
+function rollAgentProspectOnHit(userId) {
+  const rep = getAgentState(userId).reputation;
+  const r = Math.min(100, Math.max(25, rep));
+  const ceiling = Math.min(87, 74 + Math.floor((r - 52) / 5));
+  let ovr = 55 + Math.floor((r - 52) / 8) + Math.floor(Math.random() * 8) - 3;
+  const trimChance = Math.max(0.35, 0.76 - (r - 52) * 0.0065);
+  if (Math.random() < trimChance) ovr -= Math.floor(Math.random() * 4);
+  ovr = Math.max(52, Math.min(ceiling, ovr));
+  const gemChance = Math.min(0.145, 0.036 + (r - 52) * 0.00115);
+  if (Math.random() < gemChance) ovr = Math.min(89, ovr + 2 + Math.floor(Math.random() * 5));
+  const potRoll = Math.random() + r / 195;
+  const potential =
+    potRoll > 1.2 ? '★ топ-потенціал' : potRoll > 0.92 ? 'хороший запас' : 'перспективний';
+  const first = AGENT_FIRST_NAMES[Math.floor(Math.random() * AGENT_FIRST_NAMES.length)];
+  const last = AGENT_LAST_NAMES[Math.floor(Math.random() * AGENT_LAST_NAMES.length)];
+  return { first, last, ovr, potential };
+}
+
+function randomAgentScoutMissLine() {
+  const lines = [
+    '<b>Без результату.</b> Академія не пустила на огляд — спробуй пізніше.',
+    '<b>Без результату.</b> На зборах «нікого видного» — лише другий план.',
+    '<b>Без результату.</b> Тренер заховав перспективних — доступ закритий.',
+    '<b>Без результату.</b> Перегляд у «нижчій лізі» не склався — дорога марна.',
+    '<b>Без результату.</b> Конкурент встиг перехопити контакт.',
+  ];
+  return lines[Math.floor(Math.random() * lines.length)];
+}
+
+function agentEaseFromState(userId) {
+  const r = getAgentState(userId).reputation;
+  const clamped = Math.max(25, Math.min(100, r));
+  return Math.min(0.034, Math.max(0, (clamped - 42) * 0.00072));
+}
+
+function bumpAgentAfterMatch(userId, you, them) {
+  if (getCareerMode(userId) !== 'agent') return;
+  const a = getAgentState(userId);
+  if (you > them) a.reputation = Math.min(100, a.reputation + 2);
+  else if (them > you) a.reputation = Math.max(25, a.reputation - 1);
+  else a.reputation = Math.min(100, a.reputation + 1);
+}
+
+function bumpCoachOrAgentAfterFriendly(userId, you, them, leagueSnap, psSnap) {
+  if (leagueSnap || psSnap) return;
+  const m = getCareerMode(userId);
+  if (m === 'coach') bumpCoachAfterMatch(userId, you, them);
+  else if (m === 'agent') bumpAgentAfterMatch(userId, you, them);
+}
+
+function agentOfficeKeyboard(userId) {
+  const a = getAgentState(userId);
+  const rows = [];
+  rows.push([Markup.button.callback('🔍 Розвідка (новий талант)', 'agent:scout')]);
+  for (let i = 0; i < a.prospects.length; i += 1) {
+    const p = a.prospects[i];
+    const label = `💼 ${p.first.slice(0, 9)} ·${p.ovr}`.slice(0, 58);
+    rows.push([Markup.button.callback(label, `agent:sell:${i}`)]);
+  }
+  rows.push([Markup.button.callback('📇 Мережа клубів (+реп.)', 'agent:network')]);
+  rows.push([Markup.button.callback('🔙 Закрити', 'agent:close')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function openAgentOfficeOrHint(ctx) {
+  if (getCareerMode(ctx.from.id) !== 'agent') {
+    await ctx.reply(
+      '<b>🤝 Офіс агента</b> доступний у режимі агента.\nПеремкни <code>/swap</code>: клуб → гравець → тренер → <b>агент</b>. Потім «🤝 Агент» або «📊 Чемпіонат».',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  await showAgentOffice(ctx);
+}
+
+async function showAgentOffice(ctx) {
+  const uid = ctx.from.id;
+  getWallet(uid);
+  const a = getAgentState(uid);
+  const bonus = agentEaseFromState(uid).toFixed(3);
+  const tier = agentReputationTierTitle(a.reputation);
+  const failPct = Math.round(agentScoutFailChance(a.reputation) * 100);
+  const rosterLines =
+    a.prospects.length === 0
+      ? '<i>Поки нікого — натисни «Розвідка».</i>'
+      : a.prospects
+          .map((p, i) => `${i + 1}. <b>${escapeHtml(p.first)} ${escapeHtml(p.last)}</b> · OVR <b>${p.ovr}</b> · ${escapeHtml(p.potential)}`)
+          .join('\n');
+  await ctx.reply(
+    `<b>🤝 Офіс агента</b>\n\n` +
+      `<b>Репутація:</b> ${a.reputation}/100 · ${tier}\n` +
+      `<i>Ефект: рідші провали розвідки (~<b>${failPct}%</b> «нічого не знайшли»), вищі OVR і кращий потенціал талантів, більша комісія при продажі, сильніший бонус у матчі проти бота.</i>\n` +
+      `<i>Бонус до легкості матчу (зі складом): до ~<b>${bonus}</b>.</i>\n\n` +
+      `<b>Твої таланти (${a.prospects.length}/${AGENT_ROSTER_MAX}):</b>\n${rosterLines}\n\n` +
+      `<i>Без клубної ліги; товариські матчі та турніри як у тренера. Контракти — кнопками 💼.</i>\n` +
+      `Баланс: <b>${getWallet(uid).coins}</b> 🪙.`,
+    { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) }
+  );
+}
+
+/**
+ * Кар'єра гравця (режим /swap → player): сезони, контракти, симуляція турнірів, фінали гра/сим.
+ * @type {Map<number, {
+ *   season: number,
+ *   phase: 'pick_player' | 'pick_club' | 'contracts' | 'sim_idle' | 'final_pick' | 'season_outro',
+ *   playerKey: string,
+ *   playerName: string,
+ *   playerOvr: number,
+ *   playerAge: number,
+ *   playerOffers: { key: string, name: string, baseOvr: number, startAge: number }[] | null,
+ *   clubKey: string,
+ *   clubName: string,
+ *   offers: { clubKey: string, clubName: string }[] | null,
+ *   resultLines: string[],
+ *   finalsQueue: { key: string, label: string, opponent: string, strength: number }[],
+ *   leaguePlace: number | null,
+ *   cupReachedFinal: boolean,
+ *   euroReachedFinal: boolean,
+ *   wcReachedFinal: boolean,
+ *   cupWon: boolean | null,
+ *   euroWon: boolean | null,
+ *   wcWon: boolean | null,
+ *   careerStats?: { leagueTitles: number, cupWins: number, euroWins: number, wcWins: number, goldenBalls: number, goldenBoots: number, silverStars: number },
+ *   careerQuestClaimed?: Record<string, boolean>,
+ *   honorsGrantedSeason?: number | null,
+ *   accumulatedSeason?: number | null,
+ *   careerTripleCrowns?: number,
+ *   triplesRecordedSeason?: number | null,
+ * }>}
+ */
+const playerCareerByUser = new Map();
+
+/** Клуби для контрактів у кар'єрі гравця (короткі ключі для callback). */
+const PLAYER_CAREER_CLUBS = [
+  { key: 'p1', name: 'ФК «Район»' },
+  { key: 'p2', name: '«Оболонь-2»' },
+  { key: 'p3', name: '«Колос» (молодь)' },
+  { key: 'p4', name: '«Верес»' },
+  { key: 'p5', name: '«Десна»' },
+  { key: 'p6', name: '«Зоря»' },
+  { key: 'p7', name: '«Ворскла»' },
+  { key: 'p8', name: '«Шахтар» (молодь)' },
+  { key: 'p9', name: '«Динамо» (молодь)' },
+  { key: 'p10', name: '«Рух»' },
+  { key: 'p11', name: '«Металіст 1925»' },
+  { key: 'p12', name: '«Львів»' },
+  { key: 'e1', name: '«Барселона»' },
+  { key: 'e2', name: '«Реал Мадрид»' },
+  { key: 'e3', name: '«Атлетіко» (Мадрид)' },
+  { key: 'e4', name: '«Манчестер Сіті»' },
+  { key: 'e5', name: '«Ліверпуль»' },
+  { key: 'e6', name: '«Челсі»' },
+  { key: 'e7', name: '«Арсенал»' },
+  { key: 'e8', name: '«Баварія»' },
+  { key: 'e9', name: '«Боруссія Дортмунд»' },
+  { key: 'e10', name: '«Інтер»' },
+  { key: 'e11', name: '«Мілан»' },
+  { key: 'e12', name: '«Ювентус»' },
+  { key: 'e13', name: '«ПСЖ»' },
+  { key: 'e14', name: '«Марсель»' },
+  { key: 'e15', name: '«Бенфіка»' },
+  { key: 'e16', name: '«Порту»' },
+  { key: 'e17', name: '«Аякс»' },
+];
+
+const CAREER_ICON_PLAYERS = [
+  { key: 'cp_m10', name: 'Ліонель Месі', baseOvr: 93, startAge: 24 },
+  { key: 'cp_cr7', name: 'Кріштіану Роналду', baseOvr: 92, startAge: 23 },
+  { key: 'cp_neym', name: 'Неймар', baseOvr: 91, startAge: 22 },
+  { key: 'cp_mbap', name: 'Кіліан Мбаппе', baseOvr: 92, startAge: 20 },
+  { key: 'cp_haal', name: 'Ерлінг Голанд', baseOvr: 91, startAge: 21 },
+  { key: 'cp_benz', name: 'Карім Бензема', baseOvr: 90, startAge: 26 },
+  { key: 'cp_lewa', name: 'Роберт Левандовський', baseOvr: 91, startAge: 25 },
+  { key: 'cp_salah', name: 'Мохамед Салах', baseOvr: 90, startAge: 25 },
+  { key: 'cp_kdb', name: 'Кевін де Брейне', baseOvr: 91, startAge: 26 },
+  { key: 'cp_modr', name: 'Лука Модрич', baseOvr: 89, startAge: 28 },
+  { key: 'cp_vini', name: 'Вінісіус Жуніор', baseOvr: 90, startAge: 21 },
+  { key: 'cp_pedri', name: 'Педрі', baseOvr: 88, startAge: 19 },
+  { key: 'cp_belli', name: 'Джуд Беллінгем', baseOvr: 90, startAge: 20 },
+  { key: 'cp_kane', name: 'Гаррі Кейн', baseOvr: 90, startAge: 27 },
+  { key: 'cp_vvd', name: 'Вірджил ван Дейк', baseOvr: 89, startAge: 27 },
+];
+
+function careerProByKey(key) {
+  return CAREER_ICON_PLAYERS.find((p) => p.key === key) || null;
+}
+
+function pickDistinctCareerPlayersForOffers(n) {
+  const shuffled = [...CAREER_ICON_PLAYERS].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+}
+
+function careerClubByKey(key) {
+  return PLAYER_CAREER_CLUBS.find((c) => c.key === key) || null;
+}
+
+function pickDistinctCareerClubs(n, excludeKeys = []) {
+  const pool = PLAYER_CAREER_CLUBS.filter((c) => !excludeKeys.includes(c.key));
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, n);
+}
+
+function pickInitialCareerOffers() {
+  return pickDistinctCareerClubs(3).map((c) => ({ clubKey: c.key, clubName: c.name }));
+}
+
+function buildCareerContractOffers(pc) {
+  const cur = careerClubByKey(pc.clubKey);
+  if (!cur) return pickInitialCareerOffers();
+  const others = pickDistinctCareerClubs(2, [pc.clubKey]).map((c) => ({
+    clubKey: c.key,
+    clubName: c.name,
+  }));
+  const stay = { clubKey: pc.clubKey, clubName: `${cur.name} (продовжити контракт)` };
+  return [stay, ...others].sort(() => Math.random() - 0.5);
+}
+
+function createPlayerCareerState(season = 1) {
+  const picks = pickDistinctCareerPlayersForOffers(3);
+  return {
+    season,
+    phase: 'pick_player',
+    playerKey: '',
+    playerName: '',
+    playerOvr: 0,
+    playerAge: 0,
+    playerOffers: picks.map((p) => ({
+      key: p.key,
+      name: p.name,
+      baseOvr: p.baseOvr,
+      startAge: p.startAge,
+    })),
+    clubKey: '',
+    clubName: '',
+    offers: null,
+    resultLines: [],
+    finalsQueue: [],
+    leaguePlace: null,
+    cupReachedFinal: false,
+    euroReachedFinal: false,
+    wcReachedFinal: false,
+    cupWon: null,
+    euroWon: null,
+    wcWon: null,
+    careerStats: {
+      leagueTitles: 0,
+      cupWins: 0,
+      euroWins: 0,
+      wcWins: 0,
+      goldenBalls: 0,
+      goldenBoots: 0,
+      silverStars: 0,
+    },
+    careerQuestClaimed: {},
+    honorsGrantedSeason: null,
+    accumulatedSeason: null,
+    careerTripleCrowns: 0,
+    triplesRecordedSeason: null,
+  };
+}
+
+function ensureCareerStats(pc) {
+  if (!pc.careerStats) {
+    pc.careerStats = {
+      leagueTitles: 0,
+      cupWins: 0,
+      euroWins: 0,
+      wcWins: 0,
+      goldenBalls: 0,
+      goldenBoots: 0,
+      silverStars: 0,
+    };
+  }
+  if (!pc.careerQuestClaimed) pc.careerQuestClaimed = {};
+  if (pc.careerTripleCrowns == null) pc.careerTripleCrowns = 0;
+  if (pc.triplesRecordedSeason === undefined) pc.triplesRecordedSeason = null;
+}
+
+/** Додає підсумки щойно завершеного сезону до статистики кар'єри (один раз на сезон). */
+function accumulateCareerSeasonStats(pc) {
+  ensureCareerStats(pc);
+  const s = pc.careerStats;
+  if (pc.leaguePlace === 1) s.leagueTitles += 1;
+  if (pc.cupWon) s.cupWins += 1;
+  if (pc.euroWon) s.euroWins += 1;
+  if (pc.wcWon) s.wcWins += 1;
+}
+
+function careerQuestIsComplete(pc, qid) {
+  ensureCareerStats(pc);
+  const s = pc.careerStats;
+  switch (qid) {
+    case 'cq_wc_win':
+      return s.wcWins >= 1;
+    case 'cq_league_3':
+      return s.leagueTitles >= 3;
+    case 'cq_triple_once':
+      return (pc.careerTripleCrowns || 0) >= 1;
+    case 'cq_golden_3':
+      return s.goldenBalls >= 3;
+    case 'cq_euro_2':
+      return s.euroWins >= 2;
+    case 'cq_ovr93':
+      return pc.playerOvr >= 93;
+    default:
+      return false;
+  }
+}
+
+function careerQuestProgressShort(pc, qid) {
+  ensureCareerStats(pc);
+  const s = pc.careerStats;
+  switch (qid) {
+    case 'cq_wc_win':
+      return `${Math.min(s.wcWins, 1)}/1`;
+    case 'cq_league_3':
+      return `${Math.min(s.leagueTitles, 3)}/3`;
+    case 'cq_triple_once':
+      return `${Math.min(pc.careerTripleCrowns || 0, 1)}/1`;
+    case 'cq_golden_3':
+      return `${Math.min(s.goldenBalls, 3)}/3`;
+    case 'cq_euro_2':
+      return `${Math.min(s.euroWins, 2)}/2`;
+    case 'cq_ovr93':
+      return `${Math.min(pc.playerOvr || 0, 93)}/93`;
+    default:
+      return '…';
+  }
+}
+
+/** Нагороджує виконані завдання монетами (грає при переході між сезонами). */
+function evaluateNewCareerQuestRewards(userId, pc) {
+  ensureCareerStats(pc);
+  const mdLines = [];
+  const htmlLines = [];
+  for (const q of CAREER_QUEST_DEFS) {
+    if (pc.careerQuestClaimed[q.id]) continue;
+    if (!careerQuestIsComplete(pc, q.id)) continue;
+    pc.careerQuestClaimed[q.id] = true;
+    addCoins(userId, q.rewardCoins);
+    mdLines.push(`• ${q.label} · **+${q.rewardCoins}** 🪙`);
+    htmlLines.push(`• ${escapeHtml(q.label)} · +${q.rewardCoins} 🪙`);
+  }
+  return { mdLines, htmlLines };
+}
+
+function formatCareerQuestProgressHtml(pc) {
+  ensureCareerStats(pc);
+  const lines = [];
+  for (const q of CAREER_QUEST_DEFS) {
+    if (pc.careerQuestClaimed[q.id]) continue;
+    const prog = careerQuestProgressShort(pc, q.id);
+    lines.push(`• ${escapeHtml(q.label)} — <i>${escapeHtml(prog)}</i>`);
+    if (lines.length >= 5) break;
+  }
+  if (!lines.length) return '';
+  return (
+    `<b>🎯 Завдання карʼєри</b> <i>(нагорода — кнопка «Наступний сезон»)</i>\n` +
+    `${lines.join('\n')}`
+  );
+}
+
+/** Особисті нагороди — дуже м’які умови (часті Золотий / Срібний м’яч). */
+function maybeAwardSeasonHonors(userId, pc) {
+  ensureCareerStats(pc);
+  if (pc.honorsGrantedSeason === pc.season) return '';
+  const parts = [];
+  const s = pc.careerStats;
+  const majorWin = pc.cupWon || pc.euroWon || pc.wcWon;
+  const majorFinal = pc.cupReachedFinal || pc.euroReachedFinal || pc.wcReachedFinal;
+  const lp = pc.leaguePlace;
+  const goldenBall =
+    majorWin ||
+    (typeof lp === 'number' && lp <= 3) ||
+    (typeof lp === 'number' && lp <= 5 && majorFinal);
+  if (goldenBall) {
+    grantTrophy(userId, 'trophy_golden_ball');
+    addCoins(userId, 45);
+    s.goldenBalls += 1;
+    parts.push("🏅 <b>Золотий м'яч</b> сезону — трофей у /sklad · +45 🪙");
+  }
+  if (pc.wcWon) {
+    grantTrophy(userId, 'trophy_golden_boot_career');
+    addCoins(userId, 25);
+    s.goldenBoots += 1;
+    parts.push('👟 <b>Золота бутса</b> (ЧС) · трофей у /sklad · +25 🪙');
+  }
+  const silverBall =
+    !goldenBall &&
+    ((typeof lp === 'number' && lp <= 7) || majorFinal || majorWin);
+  if (silverBall) {
+    grantTrophy(userId, 'trophy_career_silver_ball');
+    addCoins(userId, 28);
+    s.silverStars += 1;
+    parts.push("🥈 <b>Срібний м'яч</b> сезону · трофей у /sklad · +28 🪙");
+  }
+  if (!parts.length) return '';
+  pc.honorsGrantedSeason = pc.season;
+  return `\n\n<b>Особисті нагороди</b>\n${parts.join('\n')}`;
+}
+
+function buildCareerEndRecapHtml(pc) {
+  ensureCareerStats(pc);
+  const s = pc.careerStats;
+  const nQuest = CAREER_QUEST_DEFS.filter((q) => pc.careerQuestClaimed[q.id]).length;
+  const nm = escapeHtml(pc.playerName || 'Гравець');
+  return (
+    `🌟 <b>Карʼєра завершена!</b> ${nm}\n\n` +
+    `📊 <b>Підсумки за 20 сезонів</b>\n` +
+    `• Чемпіонств ліги: <b>${s.leagueTitles}</b>\n` +
+    `• Кубків країни: <b>${s.cupWins}</b>\n` +
+    `• Єврокубків: <b>${s.euroWins}</b>\n` +
+    `• Чемпіонатів світу: <b>${s.wcWins}</b>\n` +
+    `• Золотих мʼячів: <b>${s.goldenBalls}</b>\n` +
+    `• Золотих бутс (ЧС): <b>${s.goldenBoots}</b>\n` +
+    `• Срібних мʼячів: <b>${s.silverStars}</b>\n` +
+    `• Тройних корон (ліга + кубок + єврокубок): <b>${pc.careerTripleCrowns || 0}</b>\n\n` +
+    `⚽ Фінальний профіль: <b>${pc.playerOvr}</b> OVR · <b>${pc.playerAge}</b> років\n` +
+    `🎯 Завдань виконано: <b>${nQuest}</b> / ${CAREER_QUEST_DEFS.length}\n\n` +
+    `+400 🪙 за завершення карʼєри`
+  );
+}
+
+function careerFakeScore() {
+  let y = Math.floor(Math.random() * 3);
+  let t = Math.floor(Math.random() * 3);
+  if (Math.random() < 0.22) y += 1;
+  if (Math.random() < 0.22) t += 1;
+  return `${Math.min(y, 5)}:${Math.min(t, 5)}`;
+}
+
+function careerWinProb(pc, stagePenalty) {
+  let base = 0.78 - (pc.season - 1) * 0.007 - stagePenalty;
+  const ovr = pc.playerOvr || 0;
+  if (ovr >= 90) base += 0.052;
+  else if (ovr >= 86) base += 0.036;
+  else if (ovr >= 82) base += 0.024;
+  else if (ovr >= 78) base += 0.012;
+  else if (ovr > 0 && ovr < 72) base -= 0.012;
+  return Math.max(0.52, Math.min(0.92, base));
+}
+
+function runCareerCupBracket(pc, title, roundsBeforeFinal, queueKey, opponentPool = LEAGUE_OPPONENTS) {
+  const lines = [];
+  const rndLabels = ['1/16', '1/8', '1/4', 'півфінал'];
+  for (let i = 0; i < roundsBeforeFinal; i++) {
+    const opp = randomPick(opponentPool).name;
+    const lbl = rndLabels[i] || `${i + 1}`;
+    const win = Math.random() < careerWinProb(pc, i * 0.042);
+    lines.push(`${title} (${lbl}): ${win ? '✅' : '✖️'} ${careerFakeScore()} vs ${opp}`);
+    if (!win) return { lines, reachedFinal: false };
+  }
+  const fo = randomPick(opponentPool);
+  let strengthBoost = 0;
+  if (queueKey === 'euro') strengthBoost = 0.044;
+  else if (queueKey === 'wc') strengthBoost = 0.058;
+  const strength = Math.min(0.22, 0.052 + (pc.season - 1) * 0.0088 + strengthBoost);
+  pc.finalsQueue.push({
+    key: queueKey,
+    label: title,
+    opponent: fo.name,
+    strength,
+  });
+  lines.push(`${title}: 🏁 фінал проти ${fo.name}`);
+  return { lines, reachedFinal: true };
+}
+
+function finalizeCareerSeasonStats(pc) {
+  if (!pc.cupReachedFinal) pc.cupWon = false;
+  else if (pc.cupWon == null) pc.cupWon = false;
+  if (!pc.euroReachedFinal) pc.euroWon = false;
+  else if (pc.euroWon == null) pc.euroWon = false;
+  if (!pc.wcReachedFinal) pc.wcWon = false;
+  else if (pc.wcWon == null) pc.wcWon = false;
+}
+
+/** Один сезон кар'єри: вік +1 і зміна OVR за підсумками (може зрости або впасти). */
+function applyCareerSeasonGrowth(pc) {
+  if (!pc.playerKey || pc.playerOvr <= 0) return;
+  pc.playerAge += 1;
+  let d = 0;
+  const lp = pc.leaguePlace ?? 6;
+  if (lp <= 2) d += 2;
+  else if (lp <= 5) d += 1;
+  else if (lp >= 9) d -= 1;
+  if (pc.cupWon) d += 2;
+  else if (pc.cupReachedFinal && pc.cupWon === false) d -= 1;
+  if (pc.euroWon) d += 2;
+  else if (pc.euroReachedFinal && pc.euroWon === false) d -= 1;
+  if (pc.wcWon) d += 3;
+  else if (pc.wcReachedFinal && pc.wcWon === false) d -= 1;
+  if (pc.playerAge <= 22) d += 1;
+  if (pc.playerAge >= 33) d -= 1;
+  if (pc.playerAge >= 36) d -= 2;
+  if (pc.playerAge >= 38) d -= 1;
+  d += Math.floor(Math.random() * 3) - 1;
+  pc.playerOvr = Math.max(55, Math.min(99, Math.round(pc.playerOvr + d)));
+}
+
+function bumpCareerOvrAfterFinal(pc, win) {
+  if (!pc?.playerOvr || pc.playerOvr <= 0) return;
+  if (win) pc.playerOvr = Math.min(99, pc.playerOvr + (Math.random() < 0.55 ? 2 : 1));
+  else pc.playerOvr = Math.max(55, pc.playerOvr - (Math.random() < 0.65 ? 1 : 0));
+}
+
+/** Заповнює чергу фіналів і resultLines; phase → final_pick або season_outro. */
+function runCareerSeasonSimulation(pc) {
+  pc.finalsQueue = [];
+  pc.leaguePlace = null;
+  pc.cupReachedFinal = false;
+  pc.euroReachedFinal = false;
+  pc.wcReachedFinal = false;
+  pc.cupWon = null;
+  pc.euroWon = null;
+  pc.wcWon = null;
+
+  const leagueLines = [];
+  let pts = 0;
+  for (let t = 0; t < 5; t++) {
+    const opp = randomPick(LEAGUE_OPPONENTS).name;
+    let winP = 0.78;
+    const ovr = pc.playerOvr || 0;
+    if (ovr >= 92) winP += 0.085;
+    else if (ovr >= 88) winP += 0.065;
+    else if (ovr >= 84) winP += 0.048;
+    else if (ovr >= 80) winP += 0.03;
+    else if (ovr >= 76) winP += 0.014;
+    else if (ovr > 0 && ovr < 74) winP -= 0.045;
+    winP = Math.max(0.64, Math.min(0.93, winP));
+    const drawHi = winP + 0.14;
+    const r = Math.random();
+    let symbol = 'П';
+    if (r < winP) {
+      symbol = 'В';
+      pts += 3;
+    } else if (r < drawHi) {
+      symbol = 'Н';
+      pts += 1;
+    }
+    leagueLines.push(`Ліга · тур ${t + 1}: ${symbol} ${careerFakeScore()} vs ${opp}`);
+  }
+  const place = Math.min(10, Math.max(1, 11 - Math.round(pts / 2.28)));
+  pc.leaguePlace = place;
+  leagueLines.push(`Ліга · підсумок: ${place} місце · ~${pts} очок`);
+
+  const cup = runCareerCupBracket(pc, 'Кубок країни', 3, 'cup');
+  pc.cupReachedFinal = cup.reachedFinal;
+  const euro = runCareerCupBracket(pc, 'Єврокубок', 2, 'euro');
+  pc.euroReachedFinal = euro.reachedFinal;
+  const wc = runCareerCupBracket(pc, 'Чемпіонат світу', 4, 'wc', CAREER_WORLD_OPPONENTS);
+  pc.wcReachedFinal = wc.reachedFinal;
+
+  pc.resultLines = [
+    `${pc.playerName} · ${pc.playerOvr} OVR · вік ${pc.playerAge}`,
+    `Клуб: ${pc.clubName}`,
+    '── ЛІГА ──',
+    ...leagueLines,
+    '── КУБОК ──',
+    ...cup.lines,
+    '── ЄВРОКУБОК ──',
+    ...euro.lines,
+    '── ЧЕМПІОНАТ СВІТУ ──',
+    ...wc.lines,
+  ];
+
+  if (pc.finalsQueue.length > 0) pc.phase = 'final_pick';
+  else {
+    finalizeCareerSeasonStats(pc);
+    pc.phase = 'season_outro';
+  }
+}
+
+function getCareerMode(userId) {
+  return careerModeByUser.get(userId) || 'club';
+}
+
+function hasIncompletePlayerCareer(userId) {
+  const pc = playerCareerByUser.get(userId);
+  return Boolean(pc && pc.season >= 1 && pc.season <= 20);
+}
+
+/** Поки йде ліга або кар'єра гравця — недоступні турнір і товариський /fifa. */
+function careerBarsTournamentOrFriendly(userId) {
+  return hasActiveLeague(userId) || hasIncompletePlayerCareer(userId);
+}
 
 function hasActiveLeague(userId) {
   const lg = leagueByUser.get(userId);
@@ -497,6 +1244,10 @@ const TROPHY_ITEMS = [
   { id: 'trophy_league_gold', name: 'Чемпіонат — золото', emoji: '🥇' },
   { id: 'trophy_league_silver', name: 'Чемпіонат — срібло', emoji: '🥈' },
   { id: 'trophy_league_bronze', name: 'Чемпіонат — бронза', emoji: '🥉' },
+  { id: 'trophy_player_career', name: "Кар'єра гравця — 20 сезонів", emoji: '🌟' },
+  { id: 'trophy_golden_ball', name: "Золотий м'яч (кар'єра)", emoji: '🏅' },
+  { id: 'trophy_golden_boot_career', name: 'Золота бутса (ЧС)', emoji: '👟' },
+  { id: 'trophy_career_silver_ball', name: "Срібний м'яч (кар'єра)", emoji: '🥈' },
 ];
 
 /** Гравці в магазині (кожного можна мати лише одного у складі). */
@@ -689,6 +1440,176 @@ function squadEaseStrength(userId) {
   return Math.min(0.11, Math.max(0, (avg - 74) * 0.0055));
 }
 
+/** Для кар'єри гравця OVR легенди теж полегшує матч проти бота (як склад). */
+function careerProEaseFromCareer(userId) {
+  const pc = playerCareerByUser.get(userId);
+  const ovr = pc?.playerOvr;
+  if (ovr == null || ovr <= 0) return 0;
+  return Math.min(0.11, Math.max(0, (ovr - 74) * 0.0055));
+}
+
+function getCoachState(userId) {
+  if (!coachStateByUser.has(userId)) {
+    coachStateByUser.set(userId, {
+      tactic: 'balance',
+      morale: 72,
+      fatigue: 0,
+      drillKind: null,
+      drillMatchesLeft: 0,
+      subsFresh: true,
+    });
+  }
+  const c = coachStateByUser.get(userId);
+  if (c.drillMatchesLeft == null || c.drillMatchesLeft < 0) c.drillMatchesLeft = 0;
+  if (!Object.prototype.hasOwnProperty.call(c, 'drillKind')) c.drillKind = null;
+  if (!coachDrillKindValid(c.drillKind)) {
+    c.drillKind = null;
+    c.drillMatchesLeft = 0;
+  }
+  if (c.subsFresh === undefined) c.subsFresh = true;
+  return c;
+}
+
+function coachDrillEaseBonus(c) {
+  if (!c.drillMatchesLeft || c.drillMatchesLeft <= 0 || !c.drillKind) return 0;
+  if (COACH_DRILL_STRONG.has(c.drillKind)) return 0.012;
+  if (COACH_DRILL_WEAK.has(c.drillKind)) return 0.009;
+  return 0;
+}
+
+function coachActiveDrillHtml(c) {
+  if (!c.drillMatchesLeft || c.drillMatchesLeft <= 0 || !c.drillKind) return '';
+  const labels = {
+    tactical: 'розстановка й модель гри',
+    pressing: 'пресинг і відбір',
+    setpieces: 'стандарти (подачі, штрафні)',
+    technical: 'техніка м’яча',
+    passes: 'паси й комбінації',
+    finishing: 'удари й завершення атак',
+  };
+  const lab = labels[c.drillKind] || 'тренування';
+  return `\n<b>Активне тренування:</b> ${lab} · ще <b>${c.drillMatchesLeft}</b> матч(ів) бонусу.`;
+}
+
+/** Додаткова «легкість» матчу для режиму тренера (resolveTurn обмежує сумарний ease). */
+function coachEaseFromState(userId) {
+  const c = getCoachState(userId);
+  let x = 0.014;
+  if (c.tactic === 'attack') x = 0.024;
+  else if (c.tactic === 'defense') x = 0.019;
+  x += (c.morale - 72) * 0.00045;
+  x -= c.fatigue * 0.0022;
+  x += coachDrillEaseBonus(c);
+  return Math.max(0, Math.min(0.048, x));
+}
+
+function bumpCoachAfterMatch(userId, you, them) {
+  if (getCareerMode(userId) !== 'coach') return;
+  const c = getCoachState(userId);
+  c.fatigue = Math.min(22, c.fatigue + 1);
+  if (you > them) c.morale = Math.min(100, c.morale + 6);
+  else if (them > you) c.morale = Math.max(42, c.morale - 7);
+  else c.morale = Math.min(100, c.morale + 2);
+  if (c.drillMatchesLeft > 0) {
+    c.drillMatchesLeft -= 1;
+    if (c.drillMatchesLeft <= 0) {
+      c.drillMatchesLeft = 0;
+      c.drillKind = null;
+    }
+  }
+  c.subsFresh = true;
+}
+
+function matchEaseCombined(userId) {
+  let ease = Math.max(squadEaseStrength(userId), careerProEaseFromCareer(userId));
+  if (getCareerMode(userId) === 'coach') ease += coachEaseFromState(userId);
+  if (getCareerMode(userId) === 'agent') ease += agentEaseFromState(userId);
+  return ease;
+}
+
+/** Головний екран офісу: матч або тренування. */
+function coachOfficeRootKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('⚽ Підготовка до матчу', 'coach:hub:match')],
+    [Markup.button.callback('🏋️ Тренування (паси, удари…)', 'coach:hub:train')],
+    [Markup.button.callback('🔙 Закрити', 'coach:close')],
+  ]);
+}
+
+/** Тактика й заміни перед грою. */
+function coachMatchPrepKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('⚡ Атака', 'coach:tactic:attack'),
+      Markup.button.callback('⚖️ Баланс', 'coach:tactic:balance'),
+      Markup.button.callback('🛡 Оборона', 'coach:tactic:defense'),
+    ],
+    [Markup.button.callback('▶️ Новий матч', 'fifa:new')],
+    [Markup.button.callback('🔁 Заміни гравців', 'coach:subs')],
+    [Markup.button.callback('← До офісу', 'coach:hub:root')],
+  ]);
+}
+
+/** Вправи на полі (окремі види тренування). */
+function coachTrainingKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('🔁 Паси', 'coach:tr:pass'),
+      Markup.button.callback('🎯 Удари', 'coach:tr:finish'),
+    ],
+    [
+      Markup.button.callback('📌 Стандарти', 'coach:tr:set'),
+      Markup.button.callback('📋 Пресинг', 'coach:tr:press'),
+    ],
+    [Markup.button.callback('🏃 Витривалість', 'coach:tr:end')],
+    [
+      Markup.button.callback('📋 Схема поля (бонус 2 матчі)', 'coach:drill:tactical'),
+      Markup.button.callback('⚽ Комбінації', 'coach:drill:technical'),
+    ],
+    [Markup.button.callback('← До офісу', 'coach:hub:root')],
+  ]);
+}
+
+function coachOfficeKeyboard() {
+  return coachOfficeRootKeyboard();
+}
+
+async function openCoachOfficeOrHint(ctx) {
+  if (getCareerMode(ctx.from.id) !== 'coach') {
+    await ctx.reply(
+      '<b>🎧 Офіс тренера</b> відкривається в режимі тренера.\nПеремкни <code>/swap</code>: клуб → гравець → тренер → агент → клуб. Далі натисни «🎧 Тренер», «📊 Чемпіонат» або кнопку «🎧 Офіс тренера» в меню.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  await showCoachOffice(ctx);
+}
+
+async function showCoachOffice(ctx) {
+  const uid = ctx.from.id;
+  const c = getCoachState(uid);
+  const tacticLabel =
+    c.tactic === 'attack' ? '⚡ Атакувальна' : c.tactic === 'defense' ? '🛡 Оборонна' : '⚖️ Збалансована';
+  const bonus = coachEaseFromState(uid).toFixed(3);
+  const w = getWallet(uid);
+  const subsLine = c.subsFresh
+    ? '<i>Заміни доступні до наступного матчу — освіжити склад.</i>'
+    : '<i>Заміни вже зіграні — знову після матчу.</i>';
+  await ctx.reply(
+    `<b>🎧 Офіс тренера</b>\n\n` +
+      `Тактика: <b>${tacticLabel}</b>\n` +
+      `Мораль: <b>${c.morale}</b>/100\n` +
+      `Втома: <b>${c.fatigue}</b>/22 <i>(занижує бонус)</i>` +
+      coachActiveDrillHtml(c) +
+      `\n\n${subsLine}\n\n` +
+      `<i>У режимі тренера ти граєш товариські матчі та турніри; клубної ліги немає — перемкни /swap на 🏟 клуб.</i>\n` +
+      `<i>Сумарний бонус до легкості матчу (зі складом): до ~<b>${bonus}</b>.</i>\n\n` +
+      `<b>Обери розділ:</b> <b>матч</b> — тактика й заміни; <b>тренування</b> — паси, удари, пресинг тощо. Усе безкоштовно.\n` +
+      `Баланс: <b>${w.coins}</b> 🪙 <i>(для магазину тощо)</i>.`,
+    { parse_mode: 'HTML', ...coachOfficeRootKeyboard() }
+  );
+}
+
 function formatSklad(userId) {
   const w = getWallet(userId);
   const lines = [`💰 Монети: **${w.coins}**`, '', '👥 **Склад команди:**'];
@@ -705,6 +1626,12 @@ function formatSklad(userId) {
     if (avgOvr > 0) {
       lines.push('', `_Середній OVR **${avgOvr.toFixed(1)}** — чим він вищий, тим легше в матчі проти бота (і на своєму ході в PvP)._`);
     }
+  }
+  if (getCareerMode(userId) === 'coach') {
+    lines.push('', '_🎧 Режим тренера: офіс — «🎧 Тренер» або «📊 Чемпіонат» (/championship)._');
+  }
+  if (getCareerMode(userId) === 'agent') {
+    lines.push('', '_🤝 Режим агента: офіс — «🤝 Агент» або «📊 Чемпіонат» (/championship)._');
   }
   lines.push('', '🏆 **Трофеї (кубки):**');
   const trophyEntries = Object.entries(w.inventory).filter(
@@ -815,6 +1742,8 @@ function startMatch(userId, opts = {}) {
     possession: 'you',
     tournament: opts.tournament || null,
     league: opts.league || null,
+    playerSeason: opts.playerSeason || null,
+    liveAnimMessageId: null,
   };
   fifaMatchByUser.set(userId, state);
   return state;
@@ -1056,17 +1985,34 @@ function endMessage(state) {
   return `\n🤝 Фінал: ${formatScore(state)}. Нічия!`;
 }
 
-function mainMenuKeyboard() {
-  return Markup.inlineKeyboard([
+function mainMenuKeyboard(userId) {
+  const rows = [];
+  if (userId != null && userId > 0) {
+    const cm = getCareerMode(userId);
+    const badge =
+      cm === 'club'
+        ? '🏟 Режим: клуб'
+        : cm === 'player'
+          ? '👤 Режим: гравець'
+          : cm === 'coach'
+            ? '🎧 Режим: тренер'
+            : '🤝 Режим: агент';
+    rows.push([Markup.button.callback(badge, 'menu:mode_tip')]);
+    rows.push([Markup.button.callback('❓ Режими карʼєри', 'menu:modes_help')]);
+  }
+  rows.push(
     [Markup.button.callback('▶️ Новий матч', 'fifa:new')],
     [Markup.button.callback('🏆 Турнір (сітка)', 'tour:menu')],
     [Markup.button.callback('📊 Чемпіонат (ліга)', 'league:menu')],
+    [Markup.button.callback('🎧 Офіс тренера', 'coach:menu')],
+    [Markup.button.callback('🤝 Офіс агента', 'agent:menu')],
     [
       Markup.button.callback('🥅 Пенальті', 'pen:new'),
       Markup.button.callback('🛒 Магазин', 'shop:open'),
     ],
-    [Markup.button.callback('👥 Склад команди', 'sklad:open')],
-  ]);
+    [Markup.button.callback('👥 Склад команди', 'sklad:open')]
+  );
+  return Markup.inlineKeyboard(rows);
 }
 
 /**
@@ -1078,6 +2024,8 @@ function bottomMenuReplyKeyboard(opts = {}) {
   const rows = [
     ['📋 Меню'],
     ['▶️ Матч', '🏆 Турнір'],
+    ['📊 Чемпіонат', '🎧 Тренер'],
+    ['🤝 Агент'],
     ['🛒 Магазин', '👥 Склад'],
     ['🥅 Пенальті'],
   ];
@@ -1122,10 +2070,12 @@ async function handleFifaStart(ctx) {
     await ctx.reply('Ти в PvP-матчі. Дограй або напиши /pvp_stop (якщо ти в цьому матчі).');
     return;
   }
-  if (hasActiveLeague(userId)) {
+  if (careerBarsTournamentOrFriendly(userId)) {
     await ctx.reply(
-      'У тебе йде **чемпіонат (ліга)**. Продовжи через «📊 Чемпіонат» або /championship, або скинь: /league_stop.',
-      { parse_mode: 'Markdown' }
+      getCareerMode(userId) === 'club'
+        ? 'У тебе йде <b>чемпіонат (ліга)</b>. Продовжи через «📊 Чемпіонат» або /championship, або скинь: /league_stop.'
+        : 'У тебе йде <b>карʼєра гравця</b> (20 сезонів). Продовжи через /championship або скинь: /league_stop.',
+      { parse_mode: 'HTML' }
     );
     return;
   }
@@ -1154,14 +2104,23 @@ async function handleFifaStart(ctx) {
     `${possessionLabel(state)}.\n` +
     `Хід 1/${state.maxTurns} (~${MINUTES_PER_TURN} хв).\n\n` +
     'Обери хід кнопками 👇 (верхній ряд — атака, нижній — захист).';
-  await replyWithMatchPhoto(ctx, {
-    caption,
-    ...fifaMoveKeyboard(),
-  });
+  await postSoloMatchLiveBoard(
+    ctx,
+    state,
+    {
+      caption,
+      ...fifaMoveKeyboard(),
+    }
+  );
 }
 
 async function startPenaltySeries(ctx, options = {}) {
-  const { fromMatchDraw = false, tournamentMeta = null, leagueMeta = null } = options;
+  const {
+    fromMatchDraw = false,
+    tournamentMeta = null,
+    leagueMeta = null,
+    playerSeasonMeta = null,
+  } = options;
   const userId = ctx.from.id;
   if (getPvpSessionByUser(userId)) {
     await ctx.reply('Спочатку заверши PvP (/pvp_stop).');
@@ -1182,6 +2141,7 @@ async function startPenaltySeries(ctx, options = {}) {
     fromMatchDraw,
     tournamentMeta: tournamentMeta || null,
     leagueMeta: leagueMeta || null,
+    playerSeasonMeta: playerSeasonMeta || null,
   });
   const st = penaltyByUser.get(userId);
   const intro = fromMatchDraw
@@ -1198,6 +2158,11 @@ async function startPenaltySeries(ctx, options = {}) {
 async function finishPenaltySeries(ctx, st) {
   const userId = ctx.from.id;
   penaltyByUser.delete(userId);
+  const coachPenaltyBump =
+    (getCareerMode(userId) === 'coach' || getCareerMode(userId) === 'agent') &&
+    !st.leagueMeta &&
+    !st.playerSeasonMeta;
+  if (coachPenaltyBump) bumpCoachOrAgentAfterFriendly(userId, st.you, st.them, st.leagueMeta, st.playerSeasonMeta);
   let tail = '';
   const drawExtra = st.fromMatchDraw ? '\n_+12 🪙 за нічию в основний час_' : '';
   if (st.you > st.them) {
@@ -1224,6 +2189,18 @@ async function finishPenaltySeries(ctx, st) {
       else tG += 1;
     }
     await finishLeagueRoundAfterMatch(ctx, userId, yG, tG, lm);
+    return;
+  }
+
+  if (st.playerSeasonMeta) {
+    const pm = st.playerSeasonMeta;
+    let yG = pm.regYou;
+    let tG = pm.regThem;
+    if (yG === tG) {
+      if (st.you > st.them) yG += 1;
+      else tG += 1;
+    }
+    await finishPlayerCareerMatch(ctx, userId, yG, tG, pm);
     return;
   }
 
@@ -1366,6 +2343,430 @@ async function finishLeagueRoundAfterMatch(ctx, userId, yG, tG, snap) {
   );
 }
 
+async function finishPlayerCareerMatch(ctx, userId, yG, tG, snap) {
+  awardAfterMatch(userId, yG, tG);
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || !snap.careerFinalKey) return;
+
+  const win = yG > tG;
+  const q = pc.finalsQueue;
+  if (q.length && q[0].key === snap.careerFinalKey) q.shift();
+
+  if (snap.careerFinalKey === 'cup') pc.cupWon = win;
+  if (snap.careerFinalKey === 'euro') pc.euroWon = win;
+  if (snap.careerFinalKey === 'wc') pc.wcWon = win;
+  bumpCareerOvrAfterFinal(pc, win);
+  const coinWin =
+    win && snap.careerFinalKey === 'wc' ? 52 : win ? 42 : 15;
+  addCoins(userId, coinWin);
+
+  await ctx.reply(
+    `🏆 ${snap.careerFinalLabel}: ${win ? '**перемога**' : '**поразка**'} (${yG}:${tG}).\n` +
+      `**${escapeMarkdownV1(pc.playerName)}** · ${pc.playerOvr} OVR · ${pc.playerAge} років\nБаланс: **${getWallet(userId).coins}** 🪙`,
+    { parse_mode: 'Markdown' }
+  );
+
+  if (pc.finalsQueue.length > 0) {
+    pc.phase = 'final_pick';
+    await promptCareerFinalChoice(ctx, pc);
+    return;
+  }
+  pc.phase = 'season_outro';
+  await showSeasonOutroSummary(ctx, userId, pc);
+}
+
+async function promptCareerFinalChoice(ctx, pc) {
+  const f = pc.finalsQueue[0];
+  if (!f) return;
+  const pct = Math.min(99, Math.round(f.strength * 380));
+  const pline =
+    pc.playerName &&
+    `<i>${escapeHtml(pc.playerName)} · ${pc.playerOvr} OVR · ${pc.playerAge} років</i>\n\n`;
+  await ctx.reply(
+    `${pline || ''}<b>Фінал</b> · ${escapeHtml(f.label)}\nvs <b>${escapeHtml(f.opponent)}</b> · сила бота ~${pct}%\n\n` +
+      'Обери: зіграти матч або швидка симуляція.',
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🎮 Грати фінал', 'pc:fplay'),
+          Markup.button.callback('⚡ Симулювати', 'pc:fsim'),
+        ],
+      ]),
+    }
+  );
+}
+
+async function showSeasonOutroSummary(ctx, userId, pc) {
+  finalizeCareerSeasonStats(pc);
+  ensureCareerStats(pc);
+  if (pc.leaguePlace === 1 && pc.cupWon && pc.euroWon && pc.triplesRecordedSeason !== pc.season) {
+    pc.careerTripleCrowns = (pc.careerTripleCrowns || 0) + 1;
+    pc.triplesRecordedSeason = pc.season;
+  }
+  const honorExtra = maybeAwardSeasonHonors(userId, pc);
+  const questBlock = formatCareerQuestProgressHtml(pc);
+
+  const cupTxt = !pc.cupReachedFinal ? 'виліт до фіналу' : pc.cupWon ? '🏆 перемога у фіналі' : 'фінал програно';
+  const euroTxt = !pc.euroReachedFinal ? 'виліт до фіналу' : pc.euroWon ? '🏆 перемога у фіналі' : 'фінал програно';
+  const wcTxt = !pc.wcReachedFinal ? 'виліт до фіналу' : pc.wcWon ? '🏆 перемога у фіналі' : 'фінал програно';
+
+  const inner = pc.resultLines.map((x) => escapeHtml(x)).join('\n');
+  let body =
+    `<b>Підсумок сезону ${pc.season}/20</b>\n${escapeHtml(pc.clubName)}\n` +
+    `<b>Гравець:</b> ${escapeHtml(pc.playerName)} · ${pc.playerOvr} OVR · ${pc.playerAge} років\n\n` +
+    `<pre>${inner}</pre>\n` +
+    `<b>Ліга:</b> ${pc.leaguePlace} місце\n<b>Кубок:</b> ${cupTxt}\n<b>Єврокубок:</b> ${euroTxt}\n<b>Чемпіонат світу:</b> ${wcTxt}`;
+  body += honorExtra;
+  if (questBlock) body += `\n\n${questBlock}`;
+
+  const kb =
+    pc.season >= 20
+      ? [[Markup.button.callback('🏁 Завершити карʼєру', 'pc:next')]]
+      : [[Markup.button.callback('▶️ Наступний сезон', 'pc:next')]];
+
+  await ctx.reply(body, { parse_mode: 'HTML', ...Markup.inlineKeyboard(kb) });
+}
+
+function careerContractKeyboard(pc) {
+  if (!pc.offers?.length) return Markup.inlineKeyboard([]);
+  return Markup.inlineKeyboard(
+    pc.offers.map((o) => [
+      Markup.button.callback(o.clubName.slice(0, 58), `pc:ctr:${o.clubKey}`),
+    ])
+  );
+}
+
+function careerPlayerPickKeyboard(pc) {
+  if (!pc.playerOffers?.length) return Markup.inlineKeyboard([]);
+  const rows = pc.playerOffers.map((p) => {
+    const lbl = `${p.name.slice(0, 20)} ·${p.baseOvr} ·${p.startAge}р`.slice(0, 58);
+    return [Markup.button.callback(lbl, `pc:pfp:${p.key}`)];
+  });
+  rows.push([Markup.button.callback('🔁 Інші зірки', 'pc:pfr')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function beginPlayerCareerFinalMatch(ctx) {
+  const userId = ctx.from.id;
+  if (getPvpSessionByUser(userId)) {
+    await ctx.reply('Спочатку заверши PvP (/pvp_stop).');
+    return;
+  }
+  if (penaltyByUser.has(userId)) {
+    await ctx.reply('Спочатку заверши пенальті.');
+    return;
+  }
+  if (tournamentProgressByUser.has(userId)) {
+    await ctx.reply('Спочатку заверши або скинь кубковий турнір (/tournament_stop).');
+    return;
+  }
+  if (hasActiveLeague(userId)) {
+    await ctx.reply('У тебе активна **ліга за клуб**. Перемкни /swap на клуб або скинь лігу.', {
+      parse_mode: 'Markdown',
+    });
+    return;
+  }
+
+  const active = getMatch(userId);
+  if (isMatchActive(active)) {
+    if (!active.playerSeason?.careerFinalKey) {
+      await ctx.reply('Зараз інший матч. Заверши або /fifa_stop.');
+      return;
+    }
+    const meta = active.playerSeason;
+    const pct = Math.min(99, Math.round(meta.strength * 380));
+    const pc0 = playerCareerByUser.get(userId);
+    const pline = pc0?.playerName
+      ? `\n${escapeHtml(pc0.playerName)} · ${pc0.playerOvr} OVR · ${pc0.playerAge} років`
+      : '';
+    await ctx.reply(
+      `🏆 <b>Фінал кар'єри</b> · сезон <b>${meta.season}/20</b>${pline}\n${escapeHtml(meta.careerFinalLabel)}\nvs <b>${escapeHtml(meta.opponent)}</b> · ~${pct}%\n\n` +
+        `▶️ Матч: <b>${formatScore(active)}</b> · хід ${active.turn + 1}/${active.maxTurns}`,
+      { parse_mode: 'HTML', ...fifaMoveKeyboard() }
+    );
+    return;
+  }
+
+  const pc = playerCareerByUser.get(userId);
+  const f = pc?.finalsQueue?.[0];
+  if (!pc || pc.phase !== 'final_pick' || !f) {
+    await ctx.reply('Немає фіналу для матчу. Відкрий /championship.');
+    return;
+  }
+
+  tournamentProgressByUser.delete(userId);
+  startMatch(userId, {
+    playerSeason: {
+      season: pc.season,
+      strength: f.strength,
+      opponent: f.opponent,
+      careerFinalKey: f.key,
+      careerFinalLabel: f.label,
+    },
+  });
+  const state = getMatch(userId);
+  const pct = Math.min(99, Math.round(f.strength * 380));
+  const cap =
+    `🏆 <b>Фінал</b> · сезон <b>${pc.season}/20</b>\n` +
+    `${escapeHtml(pc.playerName)} · ${pc.playerOvr} OVR · ${pc.playerAge} років\n` +
+    `${escapeHtml(f.label)}\nvs <b>${escapeHtml(f.opponent)}</b> · ~${pct}%\n\n` +
+    `Рахунок: <b>${formatScore(state)}</b>\n${possessionLabel(state)}.\n` +
+    `Хід 1/${state.maxTurns} — обери дію:`;
+  await postSoloMatchLiveBoard(
+    ctx,
+    state,
+    {
+      caption: cap,
+      parse_mode: 'HTML',
+      ...fifaMoveKeyboard(),
+    }
+  );
+}
+
+async function runCareerSimulationStep(ctx) {
+  const userId = ctx.from.id;
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || pc.phase !== 'sim_idle') {
+    await ctx.reply('Зараз немає кроку симуляції. Відкрий /championship.');
+    return;
+  }
+  runCareerSeasonSimulation(pc);
+  const md =
+    `📋 **Результати турнірів** · сезон ${pc.season}/20 · ${escapeMarkdownV1(pc.clubName)}\n` +
+    `Гравець: **${escapeMarkdownV1(pc.playerName)}** · ${pc.playerOvr} OVR · ${pc.playerAge} років\n\n` +
+    pc.resultLines.map((x) => `• ${escapeMarkdownV1(x)}`).join('\n');
+  await ctx.reply(md, { parse_mode: 'Markdown' });
+
+  if (pc.phase === 'final_pick') await promptCareerFinalChoice(ctx, pc);
+  else await showSeasonOutroSummary(ctx, userId, pc);
+}
+
+async function runCareerFinalSimStep(ctx) {
+  const userId = ctx.from.id;
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || pc.phase !== 'final_pick' || !pc.finalsQueue.length) {
+    await ctx.reply('Немає фіналу для симуляції.');
+    return;
+  }
+  const f = pc.finalsQueue[0];
+  const ease = matchEaseCombined(userId);
+  const win = Math.random() < Math.max(0.38, Math.min(0.78, 0.62 - f.strength * 0.95 + ease * 2.65));
+  pc.finalsQueue.shift();
+  if (f.key === 'cup') pc.cupWon = win;
+  if (f.key === 'euro') pc.euroWon = win;
+  if (f.key === 'wc') pc.wcWon = win;
+  bumpCareerOvrAfterFinal(pc, win);
+  addCoins(userId, win ? (f.key === 'wc' ? 48 : 38) : 14);
+  await ctx.reply(
+    `⚡ Симуляція фіналу (**${f.label}**): ${win ? '**перемога**' : '**поразка**'} vs ${escapeMarkdownV1(f.opponent)}.\n` +
+      `Гравець: **${escapeMarkdownV1(pc.playerName)}** · ${pc.playerOvr} OVR · ${pc.playerAge} років\n+монети · баланс **${getWallet(userId).coins}** 🪙`,
+    { parse_mode: 'Markdown' }
+  );
+
+  if (pc.finalsQueue.length > 0) await promptCareerFinalChoice(ctx, pc);
+  else {
+    pc.phase = 'season_outro';
+    await showSeasonOutroSummary(ctx, userId, pc);
+  }
+}
+
+async function advanceCareerAfterSeasonOutro(ctx) {
+  const userId = ctx.from.id;
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || pc.phase !== 'season_outro') return;
+
+  finalizeCareerSeasonStats(pc);
+  ensureCareerStats(pc);
+  if (pc.accumulatedSeason !== pc.season) {
+    accumulateCareerSeasonStats(pc);
+    pc.accumulatedSeason = pc.season;
+  }
+  const questRewards = evaluateNewCareerQuestRewards(userId, pc);
+
+  if (pc.season >= 20) {
+    const recapHtml = buildCareerEndRecapHtml(pc);
+    let trophyHtml = '';
+    if (grantTrophy(userId, 'trophy_player_career')) {
+      trophyHtml = `\n🏆 Трофей у /sklad: <b>${escapeHtml(trophyLabelById('trophy_player_career'))}</b>`;
+    }
+    playerCareerByUser.delete(userId);
+    addCoins(userId, 400);
+    let bonusHtml = '';
+    if (questRewards.htmlLines.length) {
+      bonusHtml = `\n\n<b>🎯 Бонуси завдань</b>\n${questRewards.htmlLines.join('\n')}`;
+    }
+    await ctx.reply(
+      `${recapHtml}${bonusHtml}${trophyHtml}\n\nБаланс: <b>${getWallet(userId).coins}</b> 🪙`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  applyCareerSeasonGrowth(pc);
+
+  pc.season += 1;
+  pc.phase = 'contracts';
+  pc.offers = buildCareerContractOffers(pc);
+  pc.resultLines = [];
+  pc.finalsQueue = [];
+  pc.leaguePlace = null;
+  pc.cupReachedFinal = false;
+  pc.euroReachedFinal = false;
+  pc.wcReachedFinal = false;
+  pc.cupWon = null;
+  pc.euroWon = null;
+  pc.wcWon = null;
+
+  let questPrefix = '';
+  if (questRewards.htmlLines.length) {
+    questPrefix = `<b>🎯 Завдання виконано!</b>\n${questRewards.htmlLines.join('\n')}\n\n`;
+  }
+
+  await ctx.reply(
+    questPrefix +
+      `<b>Сезон ${pc.season}/20</b>\n<b>${escapeHtml(pc.playerName)}</b> · ${pc.playerOvr} OVR · вік ${pc.playerAge}\n\nІнші клуби надсилають пропозиції — обери контракт:`,
+    { parse_mode: 'HTML', ...careerContractKeyboard(pc) }
+  );
+}
+
+async function applyCareerPlayerChoice(ctx, playerKey) {
+  const userId = ctx.from.id;
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || pc.phase !== 'pick_player' || !pc.playerOffers?.length) {
+    await ctx.reply('Зараз не час обирати гравця.');
+    return;
+  }
+  const meta = careerProByKey(playerKey);
+  const ok = pc.playerOffers.some((x) => x.key === playerKey);
+  if (!meta || !ok) {
+    await ctx.reply('Цього гравця немає серед запропонованих.');
+    return;
+  }
+
+  pc.playerKey = playerKey;
+  pc.playerName = meta.name;
+  pc.playerOvr = meta.baseOvr;
+  pc.playerAge = meta.startAge;
+  pc.playerOffers = null;
+  pc.phase = 'pick_club';
+  pc.offers = pickInitialCareerOffers();
+
+  await ctx.reply(
+    `<b>${escapeHtml(meta.name)}</b> · ${meta.baseOvr} OVR · вік ${meta.startAge}\n\nОбери клуб (перший контракт):`,
+    { parse_mode: 'HTML', ...careerContractKeyboard(pc) }
+  );
+}
+
+async function applyCareerContractChoice(ctx, clubKey) {
+  const userId = ctx.from.id;
+  const pc = playerCareerByUser.get(userId);
+  if (!pc || !pc.offers || (pc.phase !== 'pick_club' && pc.phase !== 'contracts')) return;
+
+  const hit = pc.offers.find((o) => o.clubKey === clubKey);
+  const meta = careerClubByKey(clubKey);
+  if (!hit || !meta) {
+    await ctx.reply('Такого контракту немає в списку.');
+    return;
+  }
+
+  pc.clubKey = clubKey;
+  pc.clubName = meta.name;
+  pc.offers = null;
+  pc.phase = 'sim_idle';
+
+  await ctx.reply(
+    `<b>${escapeHtml(meta.name)}</b>\nКонтракт підписано.\n<b>${escapeHtml(pc.playerName)}</b> · ${pc.playerOvr} OVR · ${pc.playerAge} років\n\nДалі — симуляція ліги, кубка, єврокубка й чемпіонату світу. Натисни кнопку нижче.`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([[Markup.button.callback('⚙️ Запустити симуляцію турнірів', 'pc:sim')]]),
+    }
+  );
+}
+
+async function showPlayerCareerPanel(ctx) {
+  const userId = ctx.from.id;
+  if (tournamentProgressByUser.has(userId)) {
+    await ctx.reply('Спочатку заверши кубковий турнір (/tournament_stop) або дограй етап.');
+    return;
+  }
+  if (getPvpSessionByUser(userId)) {
+    await ctx.reply('Спочатку заверши PvP (/pvp_stop).');
+    return;
+  }
+  if (penaltyByUser.has(userId)) {
+    await ctx.reply('Спочатку заверши пенальті.');
+    return;
+  }
+
+  const match = getMatch(userId);
+  if (isMatchActive(match) && match.playerSeason?.careerFinalKey) {
+    await beginPlayerCareerFinalMatch(ctx);
+    return;
+  }
+
+  const pc = playerCareerByUser.get(userId);
+
+  if (!pc || pc.season < 1 || pc.season > 20) {
+    await ctx.reply(
+      '<b>👤 Карʼєра гравця</b> (20 сезонів)\nОбери <b>відомого гравця</b>, потім клуб (українські й топ європейські команди). ОVR і вік змінюються з сезонами та фіналами.\nРежим клубу: /swap.\n\nПочни з кнопки нижче.',
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([[Markup.button.callback("🌟 Нова кар'єра гравця", 'league:new')]]),
+      }
+    );
+    return;
+  }
+
+  if (pc.phase === 'pick_player') {
+    await ctx.reply(
+      '<b>Обери відомого гравця</b>\nТри варіанти нижче. «Інші зірки» — інший випадковий трійник.\n<i>Після кожного сезону змінюються OVR і вік.</i>',
+      { parse_mode: 'HTML', ...careerPlayerPickKeyboard(pc) }
+    );
+    return;
+  }
+
+  if (pc.phase === 'pick_club' || pc.phase === 'contracts') {
+    const title =
+      pc.phase === 'pick_club'
+        ? '<b>Перший контракт</b>\nОбери клуб з пропозицій нижче:'
+        : `<b>Нові контракти</b> · сезон ${pc.season}/20`;
+    const extra = pc.phase === 'contracts' ? `\n\nПоточний клуб: <b>${escapeHtml(pc.clubName)}</b>` : '';
+    await ctx.reply(title + extra, {
+      parse_mode: 'HTML',
+      ...careerContractKeyboard(pc),
+    });
+    return;
+  }
+
+  if (pc.phase === 'sim_idle') {
+    await ctx.reply(
+      `<b>👤 Сезон ${pc.season}/20</b>\n<b>${escapeHtml(pc.playerName)}</b> · ${pc.playerOvr} OVR · ${pc.playerAge} років\nКлуб: <b>${escapeHtml(pc.clubName)}</b>\n\n` +
+        'Натисни — згенеруються результати ліги, кубка країни, єврокубка й чемпіонат світу (збірні). Якщо дійдеш до фіналу — зможеш грати або симулювати.',
+      {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('⚙️ Запустити симуляцію турнірів', 'pc:sim')],
+          [Markup.button.callback("🗑 Скинути кар'єру", 'league:reset')],
+        ]),
+      }
+    );
+    return;
+  }
+
+  if (pc.phase === 'final_pick') {
+    await promptCareerFinalChoice(ctx, pc);
+    return;
+  }
+
+  if (pc.phase === 'season_outro') {
+    await showSeasonOutroSummary(ctx, userId, pc);
+    return;
+  }
+
+  await ctx.reply('Відкрий /championship ще раз або напиши /menu.');
+}
+
 async function beginLeagueRound(ctx) {
   const userId = ctx.from.id;
   if (getPvpSessionByUser(userId)) {
@@ -1378,6 +2779,27 @@ async function beginLeagueRound(ctx) {
   }
   if (tournamentProgressByUser.has(userId)) {
     await ctx.reply('Спочатку заверши або скинь кубковий турнір (/tournament_stop).');
+    return;
+  }
+  if (getCareerMode(userId) === 'coach') {
+    await ctx.reply(
+      'У режимі <b>тренера</b> немає матчів ліги. Перемкни <code>/swap</code> на 🏟 клуб.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (getCareerMode(userId) === 'agent') {
+    await ctx.reply(
+      'У режимі <b>агента</b> немає матчів ліги. Перемкни <code>/swap</code> на 🏟 клуб.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (hasIncompletePlayerCareer(userId)) {
+    await ctx.reply(
+      'Спочатку заверши або скинь <b>карʼєру гравця</b> (/swap на режим гравця, потім /league_stop).',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   const active = getMatch(userId);
@@ -1421,15 +2843,31 @@ async function beginLeagueRound(ctx) {
     `📊 <b>Чемпіонат</b> · тур <b>${lg.round + 1}/9</b>\nvs <b>${escapeHtml(opp.name)}</b>\n\n${table}\n\n` +
     `Рахунок матчу: <b>${formatScore(state)}</b>\n${possessionLabel(state)}.\n` +
     `Хід 1/${state.maxTurns} — обери дію:`;
-  await replyWithMatchPhoto(ctx, {
-    caption: cap,
-    parse_mode: 'HTML',
-    ...fifaMoveKeyboard(),
-  });
+  await postSoloMatchLiveBoard(
+    ctx,
+    state,
+    {
+      caption: cap,
+      parse_mode: 'HTML',
+      ...fifaMoveKeyboard(),
+    }
+  );
 }
 
 async function showLeaguePanel(ctx) {
   const userId = ctx.from.id;
+  if (getCareerMode(userId) === 'player') {
+    await showPlayerCareerPanel(ctx);
+    return;
+  }
+  if (getCareerMode(userId) === 'coach') {
+    await showCoachOffice(ctx);
+    return;
+  }
+  if (getCareerMode(userId) === 'agent') {
+    await showAgentOffice(ctx);
+    return;
+  }
   if (tournamentProgressByUser.has(userId)) {
     await ctx.reply('Спочатку заверши кубковий турнір (/tournament_stop) або дограй етап.');
     return;
@@ -1472,8 +2910,11 @@ async function showLeaguePanel(ctx) {
 
 async function beginTournamentRound(ctx, defId, stageIndex) {
   const userId = ctx.from.id;
-  if (hasActiveLeague(userId)) {
-    await ctx.reply('Спочатку заверши чемпіонат (ліга) або /league_stop.');
+  if (careerBarsTournamentOrFriendly(userId)) {
+    await ctx.reply(
+      'Спочатку заверши <b>лігу</b> або <b>карʼєру гравця</b> (/league_stop) або продовж через /championship.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   if (getPvpSessionByUser(userId)) {
@@ -1493,19 +2934,24 @@ async function beginTournamentRound(ctx, defId, stageIndex) {
     `🏆 **Турнірний матч** · ${meta.label}\n${bracket}\n\n` +
     `Рахунок ${formatScore(state)}.\n${possessionLabel(state)}.\n` +
     `Хід 1/${state.maxTurns} (~${MINUTES_PER_TURN} хв) — обери хід:`;
-  await replyWithMatchPhoto(ctx, {
-    caption,
-    parse_mode: 'Markdown',
-    ...fifaMoveKeyboard(),
-  });
+  await postSoloMatchLiveBoard(
+    ctx,
+    state,
+    {
+      caption,
+      parse_mode: 'Markdown',
+      ...fifaMoveKeyboard(),
+    }
+  );
 }
 
 async function showTournamentPanel(ctx) {
   const userId = ctx.from.id;
-  if (hasActiveLeague(userId)) {
-    await ctx.reply('У тебе йде **чемпіонат (ліга)**. Заверши /league_stop або продовжи через /championship.', {
-      parse_mode: 'Markdown',
-    });
+  if (careerBarsTournamentOrFriendly(userId)) {
+    await ctx.reply(
+      'У тебе йде <b>чемпіонат (ліга)</b> або <b>карʼєра гравця</b>. Заверши /league_stop або продовж через /championship.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   if (getPvpSessionByUser(userId)) {
@@ -1564,25 +3010,31 @@ bot.start(async (ctx) => {
     '**Пенальті:** /penalty\n' +
     '**Магазин:** /shop (паки й сувеніри) · **Склад:** /sklad\n' +
     '**Турнір:** «🏆 Турнір» знизу, інлайн або /tournament\n' +
-    '**Чемпіонат:** «📊 Чемпіонат» або /championship — 10 команд, 9 турів\n' +
-    'Зупинити свій матч: /fifa_stop, /penalty_stop, /tournament_stop, /league_stop\n\n' +
+    '**Чемпіонат / карʼєра:** «📊 Чемпіонат» або /championship — клуб (ліга), гравець (20 сезонів), **тренер** або **агент** (офіси через меню знизу): перемикання **/swap** (клуб → гравець → тренер → агент)\n' +
+    'Зупинити: /fifa_stop, /penalty_stop, /tournament_stop, /league_stop (ліга чи карʼєра гравця залежно від режиму)\n\n' +
     'Захист у матчі: «Відбір», «Блок», «Пресинг» або /tackle, /block, /mark.\n\n' +
+    '🔖 У інлайн-меню зверху: **режим карʼєри** (клуб / гравець / тренер / агент) та **❓ Режими карʼєри**.\n\n' +
     '🔽 **Кнопки меню знизу** — швидкий доступ (наступне повідомлення).';
-  await replyWithMatchPhoto(ctx, {
-    caption,
+  await ctx.reply(caption, {
     parse_mode: 'Markdown',
-    ...mainMenuKeyboard(),
+    ...mainMenuKeyboard(ctx.from.id),
   });
   await ctx.reply('⌨️ Меню знизу екрана:', bottomMenuReplyKeyboard());
 });
 
 bot.command('menu', async (ctx) => {
-  await ctx.reply('Обери дію:', { parse_mode: 'Markdown', ...mainMenuKeyboard() });
+  await ctx.reply(
+    'Обери дію.\n_Інлайн зверху_: режим (**клуб / гравець / тренер / агент**) та **❓ Режими карʼєри**.',
+    { parse_mode: 'Markdown', ...mainMenuKeyboard(ctx.from.id) }
+  );
   await ctx.reply('⌨️ Меню знизу екрана:', bottomMenuReplyKeyboard());
 });
 
 bot.hears(/^📋 Меню$/, async (ctx) => {
-  await ctx.reply('Головне меню:', { parse_mode: 'Markdown', ...mainMenuKeyboard() });
+  await ctx.reply(
+    'Головне меню:\n_Зверху_: активний режим (**клуб** / **гравець** / **тренер** / **агент**) та довідка **❓ Режими карʼєри**.',
+    { parse_mode: 'Markdown', ...mainMenuKeyboard(ctx.from.id) }
+  );
   await ctx.reply('⌨️ Меню знизу екрана:', bottomMenuReplyKeyboard());
 });
 
@@ -1592,6 +3044,18 @@ bot.hears(/^▶️ Матч$/, async (ctx) => {
 
 bot.hears(/^🏆 Турнір$/, async (ctx) => {
   await showTournamentPanel(ctx);
+});
+
+bot.hears(/^📊 Чемпіонат$/, async (ctx) => {
+  await showLeaguePanel(ctx);
+});
+
+bot.hears(/^🎧 Тренер$/, async (ctx) => {
+  await openCoachOfficeOrHint(ctx);
+});
+
+bot.hears(/^🤝 Агент$/, async (ctx) => {
+  await openAgentOfficeOrHint(ctx);
 });
 
 bot.hears(/^🛒 Магазин$/, async (ctx) => {
@@ -1646,9 +3110,86 @@ bot.command('tournament_stop', (ctx) => {
 });
 
 bot.command('league_stop', (ctx) => {
-  leagueByUser.delete(ctx.from.id);
-  fifaMatchByUser.delete(ctx.from.id);
+  const uid = ctx.from.id;
+  fifaMatchByUser.delete(uid);
+  if (getCareerMode(uid) === 'player') {
+    playerCareerByUser.delete(uid);
+    ctx.reply("Кар'єру гравця скинуто. /championship — почати знову.");
+    return;
+  }
+  if (getCareerMode(uid) === 'coach') {
+    coachStateByUser.delete(uid);
+    ctx.reply('Режим тренера: офіс скинуто (тактика, мораль, втома). /championship — офіс знову.');
+    return;
+  }
+  if (getCareerMode(uid) === 'agent') {
+    agentStateByUser.delete(uid);
+    ctx.reply('Режим агента: офіс скинуто (репутація, таланти). /championship — офіс знову.');
+    return;
+  }
+  leagueByUser.delete(uid);
   ctx.reply('Чемпіонат (лігу) скинуто. /championship — почати знову.');
+});
+
+bot.command('swap', async (ctx) => {
+  const uid = ctx.from.id;
+  if (getPvpSessionByUser(uid)) {
+    await ctx.reply('Заверши спочатку PvP (/pvp_stop).');
+    return;
+  }
+  if (penaltyByUser.has(uid)) {
+    await ctx.reply('Заверши спочатку пенальті (/penalty_stop).');
+    return;
+  }
+  if (isMatchActive(getMatch(uid))) {
+    await ctx.reply('Заверши спочатку матч (/fifa_stop) або дограй.');
+    return;
+  }
+  if (tournamentProgressByUser.has(uid)) {
+    await ctx.reply('Заверши або скинь турнір (/tournament_stop).');
+    return;
+  }
+  if (hasActiveLeague(uid)) {
+    await ctx.reply(
+      'Спочатку заверши або скинь <b>лігу за клуб</b> (/league_stop), потім /swap.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (hasIncompletePlayerCareer(uid)) {
+    await ctx.reply(
+      'Спочатку заверши або скинь <b>карʼєру гравця</b> (/league_stop у цьому режимі), потім /swap.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  const cycle = ['club', 'player', 'coach', 'agent'];
+  const cur = getCareerMode(uid);
+  let idx = cycle.indexOf(cur);
+  if (idx < 0) idx = 0;
+  const next = cycle[(idx + 1) % cycle.length];
+  careerModeByUser.set(uid, next);
+  if (next === 'player') {
+    await ctx.reply(
+      '🔁 Режим: <b>карʼєра гравця</b> (20 сезонів).\n/championship — старт або продовження. Далі: /swap → тренер.',
+      { parse_mode: 'HTML' }
+    );
+  } else if (next === 'coach') {
+    await ctx.reply(
+      '🔁 Режим: <b>тренер</b>.\n/championship — офіс (тактика, тренування). Товариські /fifa та 🏆 турніри без клубної ліги. Далі /swap → агент.',
+      { parse_mode: 'HTML' }
+    );
+  } else if (next === 'agent') {
+    await ctx.reply(
+      '🔁 Режим: <b>агент</b>.\n/championship або «🤝 Агент» — розвідка талантів, продаж контрактів, репутація. Товариські та турніри без ліги. Далі /swap → клуб.',
+      { parse_mode: 'HTML' }
+    );
+  } else {
+    await ctx.reply(
+      '🔁 Режим: <b>клуб</b> (ліга, 9 турів).\n/championship — чемпіонат. Інші режими: /swap.',
+      { parse_mode: 'HTML' }
+    );
+  }
 });
 
 bot.command('championship', async (ctx) => {
@@ -1680,20 +3221,478 @@ bot.action('league:new', async (ctx) => {
     return;
   }
   fifaMatchByUser.delete(userId);
+
+  if (getCareerMode(userId) === 'player') {
+    if (hasActiveLeague(userId)) {
+      await ctx.reply(
+        'Спочатку заверши або скинь <b>лігу за клуб</b> (/swap на клуб, потім /league_stop).',
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    playerCareerByUser.set(userId, createPlayerCareerState(1));
+    await showPlayerCareerPanel(ctx);
+    return;
+  }
+
+  if (getCareerMode(userId) === 'coach') {
+    await ctx.reply(
+      'У режимі тренера немає клубної ліги. Перемкни <code>/swap</code> на 🏟 клуб або відкрий офіс через «🎧 Тренер» / «📊 Чемпіонат».',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  if (getCareerMode(userId) === 'agent') {
+    await ctx.reply(
+      'У режимі <b>агента</b> немає клубної ліги. Офіс — «🤝 Агент» або «📊 Чемпіонат». Перемкни <code>/swap</code> на 🏟 клуб.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  if (hasIncompletePlayerCareer(userId)) {
+    await ctx.reply(
+      'Спочатку заверши або скинь <b>карʼєру гравця</b> (/swap на режим гравця, потім /league_stop).',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
   leagueByUser.set(userId, { rows: createLeagueRows(userId), round: 0, finished: false });
   await beginLeagueRound(ctx);
 });
 
 bot.action('league:play', async (ctx) => {
   await ctx.answerCbQuery();
-  await beginLeagueRound(ctx);
+  if (getCareerMode(ctx.from.id) === 'player') {
+    await showPlayerCareerPanel(ctx);
+    return;
+  }
+  if (getCareerMode(ctx.from.id) === 'coach') {
+    await showCoachOffice(ctx);
+    return;
+  }
+  if (getCareerMode(ctx.from.id) === 'agent') {
+    await showAgentOffice(ctx);
+    return;
+  }
 });
 
 bot.action('league:reset', async (ctx) => {
   await ctx.answerCbQuery();
-  leagueByUser.delete(ctx.from.id);
-  fifaMatchByUser.delete(ctx.from.id);
+  const userId = ctx.from.id;
+  fifaMatchByUser.delete(userId);
+  if (getCareerMode(userId) === 'player') {
+    playerCareerByUser.delete(userId);
+    await ctx.reply('Карʼєру гравця скинуто.');
+    return;
+  }
+  if (getCareerMode(userId) === 'coach') {
+    coachStateByUser.delete(userId);
+    await ctx.reply('Офіс тренера скинуто (тактика й стан команди на стартових значеннях при наступному відкритті).');
+    return;
+  }
+  if (getCareerMode(userId) === 'agent') {
+    agentStateByUser.delete(userId);
+    await ctx.reply('Офіс агента скинуто (репутація й список талантів — з нуля при наступному відкритті).');
+    return;
+  }
+  leagueByUser.delete(userId);
   await ctx.reply('Лігу скинуто.');
+});
+
+bot.action(/^coach:tactic:(attack|balance|defense)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  const t = ctx.match[1];
+  getCoachState(uid).tactic = t;
+  const label = t === 'attack' ? '⚡ Атакувальна' : t === 'defense' ? '🛡 Оборонна' : '⚖️ Збалансована';
+  await ctx.reply(`Тактика: <b>${label}</b>`, { parse_mode: 'HTML', ...coachMatchPrepKeyboard() });
+});
+
+bot.action('coach:hub:match', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (getCareerMode(ctx.from.id) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  await ctx.reply(
+    '<b>⚽ Підготовка до матчу</b>\nОбери <b>схему гри</b> (атака / баланс / оборона) і за потреби зроби <b>заміни</b> перед грою.',
+    { parse_mode: 'HTML', ...coachMatchPrepKeyboard() }
+  );
+});
+
+bot.action('coach:hub:train', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (getCareerMode(ctx.from.id) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  await ctx.reply(
+    '<b>🏋️ Тренування на полі</b>\nПаси, удари, стандарти, пресинг, витривалість — безкоштовно. Частина вправ дає бонус ще на кілька матчів (див. офіс).\nТакож є класичні блоки «схема поля» та «комбінації».',
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:hub:root', async (ctx) => {
+  await ctx.answerCbQuery();
+  if (getCareerMode(ctx.from.id) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  await ctx.reply(
+    '<b>🎧 Офіс тренера</b>\nОбери: <b>підготовка до матчу</b> або <b>тренування</b>.',
+    { parse_mode: 'HTML', ...coachOfficeRootKeyboard() }
+  );
+});
+
+bot.action('coach:menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  await openCoachOfficeOrHint(ctx);
+});
+
+bot.action('coach:train', async (ctx) => {
+  await ctx.answerCbQuery({ text: 'Обери розділ' });
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  await ctx.reply(
+    'Меню оновлено: спочатку <b>матч</b> або <b>тренування</b>, далі детальні кнопки.',
+    { parse_mode: 'HTML', ...coachOfficeRootKeyboard() }
+  );
+});
+
+bot.action('coach:drill:physical', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.fatigue = Math.max(0, c.fatigue - 8);
+  c.morale = Math.min(100, c.morale + 2);
+  await ctx.reply(
+    `<b>🏃 Фізичне навантаження.</b> Безкоштовно.\nВтома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:drill:tactical', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'tactical';
+  c.drillMatchesLeft = 2;
+  c.morale = Math.min(100, c.morale + 3);
+  await ctx.reply(
+    `<b>📋 Схема поля.</b> Безкоштовно.\nДва наступні матчі — сильніший бонус до легкості. Мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:drill:technical', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'technical';
+  c.drillMatchesLeft = 2;
+  c.fatigue = Math.max(0, c.fatigue - 3);
+  c.morale = Math.min(100, c.morale + 4);
+  await ctx.reply(
+    `<b>⚽ Комбінації.</b> Безкоштовно.\nДва матчі — середній бонус до легкості. Втома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:subs', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  const c = getCoachState(uid);
+  if (!c.subsFresh) {
+    await ctx.reply('Заміни вже використані — зіграй матч, щоб знову освіжити склад.', {
+      parse_mode: 'HTML',
+      ...coachMatchPrepKeyboard(),
+    });
+    return;
+  }
+  getWallet(uid);
+  c.fatigue = Math.max(0, c.fatigue - 7);
+  c.morale = Math.min(100, c.morale + 3);
+  c.subsFresh = false;
+  await ctx.reply(
+    `<b>🔁 Заміни.</b> Безкоштовно.\nСвіжі ноги перед матчем. Втома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>. Наступні заміни — після матчу.`,
+    { parse_mode: 'HTML', ...coachMatchPrepKeyboard() }
+  );
+});
+
+bot.action('coach:tr:end', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.fatigue = Math.max(0, c.fatigue - 8);
+  c.morale = Math.min(100, c.morale + 2);
+  await ctx.reply(
+    `<b>🏃 Витривалість.</b> Безкоштовно.\nБігові вправи — менша втома, трохи краща мораль. Без бонусу «на кілька матчів».\nВтома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:tr:pass', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'passes';
+  c.drillMatchesLeft = 2;
+  c.morale = Math.min(100, c.morale + 3);
+  await ctx.reply(
+    `<b>🔁 Паси й комбінації.</b> Безкоштовно.\nДва матчі — середній бонус до легкості. Мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:tr:finish', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'finishing';
+  c.drillMatchesLeft = 2;
+  c.fatigue = Math.max(0, c.fatigue - 2);
+  c.morale = Math.min(100, c.morale + 4);
+  await ctx.reply(
+    `<b>🎯 Удари й завершення.</b> Безкоштовно.\nДва матчі — середній бонус. Втома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:tr:set', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'setpieces';
+  c.drillMatchesLeft = 2;
+  c.morale = Math.min(100, c.morale + 2);
+  await ctx.reply(
+    `<b>📌 Стандарти.</b> Безкоштовно.\nДва матчі — сильніший бонус до легкості. Мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:tr:press', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'coach') {
+    await ctx.reply('Це меню лише в режимі тренера. Напиши /swap.');
+    return;
+  }
+  getWallet(uid);
+  const c = getCoachState(uid);
+  c.drillKind = 'pressing';
+  c.drillMatchesLeft = 2;
+  c.fatigue = Math.max(0, c.fatigue - 1);
+  c.morale = Math.min(100, c.morale + 3);
+  await ctx.reply(
+    `<b>📋 Пресинг.</b> Безкоштовно.\nДва матчі — сильніший бонус до легкості. Втома: <b>${c.fatigue}</b>, мораль: <b>${c.morale}</b>.`,
+    { parse_mode: 'HTML', ...coachTrainingKeyboard() }
+  );
+});
+
+bot.action('coach:close', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Готово. Матч — ▶️ Матч, турнір — меню, офіс тренера — «🎧 Тренер», «📊 Чемпіонат» або «🎧 Офіс тренера».');
+});
+
+bot.action('agent:menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  await openAgentOfficeOrHint(ctx);
+});
+
+bot.action('agent:scout', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'agent') {
+    await ctx.reply('Це меню лише в режимі агента. Напиши /swap.');
+    return;
+  }
+  const a = getAgentState(uid);
+  if (a.prospects.length >= AGENT_ROSTER_MAX) {
+    await ctx.reply(
+      `<b>Ростер повний</b> (${AGENT_ROSTER_MAX}/${AGENT_ROSTER_MAX}). Спочатку продай талант кнопкою 💼.`,
+      { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) }
+    );
+    return;
+  }
+  const rep = a.reputation;
+  if (Math.random() < agentScoutFailChance(rep)) {
+    await ctx.reply(randomAgentScoutMissLine(), { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) });
+    return;
+  }
+  const p = rollAgentProspectOnHit(uid);
+  a.prospects.push(p);
+  await ctx.reply(
+    `<b>🔍 Новий талант:</b> ${escapeHtml(p.first)} ${escapeHtml(p.last)}, OVR <b>${p.ovr}</b>, ${escapeHtml(p.potential)}.`,
+    { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) }
+  );
+});
+
+bot.action(/^agent:sell:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'agent') {
+    await ctx.reply('Це меню лише в режимі агента. Напиши /swap.');
+    return;
+  }
+  const idx = parseInt(ctx.match[1], 10);
+  const a = getAgentState(uid);
+  if (idx < 0 || idx >= a.prospects.length) {
+    await ctx.reply('Такого номера в списку вже немає — онови офіс.', { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) });
+    return;
+  }
+  const [p] = a.prospects.splice(idx, 1);
+  const w = getWallet(uid);
+  const rep = a.reputation;
+  const base = p.ovr * 5 + 18 + Math.floor(Math.random() * 38) + Math.floor(rep / 3);
+  const prestigeCut = Math.floor((p.ovr * rep) / 72);
+  const pay = base + prestigeCut;
+  w.coins += pay;
+  a.reputation = Math.min(100, a.reputation + 2 + (p.ovr >= 78 ? 1 : 0));
+  await ctx.reply(
+    `<b>💼 Угода:</b> ${escapeHtml(p.first)} ${escapeHtml(p.last)} → клуб.\n+<b>${pay}</b> 🪙 <i>(база + престиж × OVR)</i> · репутація <b>${a.reputation}</b>. Баланс: <b>${w.coins}</b> 🪙`,
+    { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) }
+  );
+});
+
+bot.action('agent:network', async (ctx) => {
+  await ctx.answerCbQuery();
+  const uid = ctx.from.id;
+  if (getCareerMode(uid) !== 'agent') {
+    await ctx.reply('Це меню лише в режимі агента. Напиши /swap.');
+    return;
+  }
+  const a = getAgentState(uid);
+  const gain = Math.random() < 0.38 ? 2 : 1;
+  a.reputation = Math.min(100, a.reputation + gain);
+  await ctx.reply(
+    `<b>📇 Мережа клубів.</b> Обід із директорами та скаутами — контакти свіжі.\nРепутація <b>+${gain}</b> (тепер <b>${a.reputation}</b>).`,
+    { parse_mode: 'HTML', ...agentOfficeKeyboard(uid) }
+  );
+});
+
+bot.action('agent:close', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Готово. Офіс агента — «🤝 Агент», «📊 Чемпіонат» або «🤝 Офіс агента» в меню.');
+});
+
+bot.action('menu:mode_tip', async (ctx) => {
+  const m = getCareerMode(ctx.from.id);
+  await ctx.answerCbQuery({
+    text:
+      m === 'club'
+        ? '🏟 Клуб — «📊 Чемпіонат», ліга 9 турів'
+        : m === 'player'
+          ? '👤 Гравець — /championship, 20 сезонів'
+          : m === 'coach'
+            ? '🎧 Тренер — «🎧 Тренер» / «📊 Чемпіонат», /fifa та турнір'
+            : '🤝 Агент — «🤝 Агент» / «📊 Чемпіонат», розвідка й контракти',
+  });
+});
+
+bot.action('menu:modes_help', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    '<b>Режими карʼєри</b> (перемикання — <code>/swap</code>: клуб → гравець → тренер → агент → клуб, якщо немає активних матчів і незавершеної карʼєри гравця)\n\n' +
+      '🏟 <b>За клуб</b> — чемпіонат із таблицею (9 турів).\n\n' +
+      '👤 <b>За гравця</b> — спершу обираєш відомого гравця (можна «Інші зірки»), потім контракт із пропозицій клубів, у т. ч. топ-клубів Європи; між сезонами — нові офери. Під час карʼєри росте <b>вік</b>, <b>OVR</b> може підвищуватися й падати залежно від результатів і сезону. За рік симулюються ліга, кубок, єврокубок і <b>чемпіонат світу</b>; у фіналі — <b>симулювати</b> або <b>грати</b>. За результати сезону можливі особисті нагороди (Золотий м’яч тощо, трофеї в /sklad), у підсумку сезону показані <b>завдання карʼєри</b> — бонус монетами при «Наступний сезон». Після 20 сезонів — розгорнутий звіт.\n\n' +
+      '🎧 <b>Тренер</b> — офіс: «🎧 Тренер», «📊 Чемпіонат» або «🎧 Офіс тренера». Спочатку дві гілки: <b>підготовка до матчу</b> (схема, заміни, старт матчу) і <b>тренування</b> (паси, удари, стандарти, пресинг, витривалість тощо). Тренування й заміни безкоштовно; частина вправ дає бонус на кілька матчів. Без клубної ліги; товариські матчі та турніри. Після матчів росте втома й змінюється мораль.\n\n' +
+      '🤝 <b>Агент</b> — офіс: «🤝 Агент», «📊 Чемпіонат» або «🤝 Офіс агента». <b>Репутація</b> відкриває рівні (новачок → еліта), зменшує провали розвідки, піднімає стелю OVR і шанс «топ-потенціалу», збільшує комісію при продажі (бонус від rep × OVR) і посилює легкість матчів проти бота. Розвідка часто без результату — качай rep перемогами, угодами та «мережею клубів».\n\n' +
+      '<i>Верхні інлайн-кнопки показують активний режим.</i>',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('pc:sim', async (ctx) => {
+  await ctx.answerCbQuery({ text: 'Симуляція…' });
+  await runCareerSimulationStep(ctx);
+});
+
+bot.action('pc:fsim', async (ctx) => {
+  await ctx.answerCbQuery();
+  await runCareerFinalSimStep(ctx);
+});
+
+bot.action('pc:fplay', async (ctx) => {
+  await ctx.answerCbQuery();
+  await beginPlayerCareerFinalMatch(ctx);
+});
+
+bot.action('pc:next', async (ctx) => {
+  await ctx.answerCbQuery();
+  await advanceCareerAfterSeasonOutro(ctx);
+});
+
+bot.action(/^pc:ctr:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await applyCareerContractChoice(ctx, ctx.match[1]);
+});
+
+bot.action(/^pc:pfp:([\w]+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await applyCareerPlayerChoice(ctx, ctx.match[1]);
+});
+
+bot.action('pc:pfr', async (ctx) => {
+  await ctx.answerCbQuery();
+  const pc = playerCareerByUser.get(ctx.from.id);
+  if (!pc || pc.phase !== 'pick_player') return;
+  const picks = pickDistinctCareerPlayersForOffers(3);
+  pc.playerOffers = picks.map((p) => ({
+    key: p.key,
+    name: p.name,
+    baseOvr: p.baseOvr,
+    startAge: p.startAge,
+  }));
+  await ctx.reply('Інші кандидати:', { parse_mode: 'HTML', ...careerPlayerPickKeyboard(pc) });
 });
 
 bot.action(/^tour:start:([\w]+)$/, async (ctx) => {
@@ -1704,8 +3703,11 @@ bot.action(/^tour:start:([\w]+)$/, async (ctx) => {
     return;
   }
   const userId = ctx.from.id;
-  if (hasActiveLeague(userId)) {
-    await ctx.reply('Спочатку заверши чемпіонат (ліга) або /league_stop.');
+  if (careerBarsTournamentOrFriendly(userId)) {
+    await ctx.reply(
+      'Спочатку заверши <b>лігу</b> або <b>карʼєру гравця</b> (/league_stop) або продовж через /championship.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   if (getPvpSessionByUser(userId)) {
@@ -1727,8 +3729,11 @@ bot.action(/^tour:start:([\w]+)$/, async (ctx) => {
 bot.action('tour:resume', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
-  if (hasActiveLeague(userId)) {
-    await ctx.reply('Спочатку заверши чемпіонат (ліга) або /league_stop.');
+  if (careerBarsTournamentOrFriendly(userId)) {
+    await ctx.reply(
+      'Спочатку заверши <b>лігу</b> або <b>карʼєру гравця</b> (/league_stop) або продовж через /championship.',
+      { parse_mode: 'HTML' }
+    );
     return;
   }
   if (getPvpSessionByUser(userId)) {
@@ -2110,6 +4115,7 @@ async function handlePvpStart(ctx) {
     moveNum: 0,
     maxTurns: MAX_TURNS,
     possession: 'you',
+    liveAnimMsgByPlayer: new Map(),
   };
   pvpSessions.set(sid, session);
   pvpUserToSession.set(id1, sid);
@@ -2126,10 +4132,13 @@ async function handlePvpStart(ctx) {
 
   const turnLine = `Хід <b>1/${MAX_TURNS}</b> — обери кнопкою або команду:`;
   try {
-    await ctx.telegram.sendMessage(id1, `${intro}\n\n${turnLine}`, {
-      parse_mode: 'HTML',
-      ...pvpMoveKeyboard(),
-    });
+    await postPvpMatchLiveBoard(
+      ctx.telegram,
+      session,
+      id1,
+      `${intro}\n\n${turnLine}`,
+      { ...pvpMoveKeyboard() }
+    );
   } catch {
     await ctx.reply(
       `Не вдалося написати першому гравцю (<code>${id1}</code>). Нехай він напише боту /start.`,
@@ -2139,10 +4148,12 @@ async function handlePvpStart(ctx) {
     return;
   }
   try {
-    await ctx.telegram.sendMessage(
+    await postPvpMatchLiveBoard(
+      ctx.telegram,
+      session,
       id2,
       `${intro}\n\n<i>Очікуй хід суперника (${n1h}).</i>`,
-      { parse_mode: 'HTML' }
+      {}
     );
   } catch {
     try {
@@ -2176,7 +4187,7 @@ async function playTurnPvP(ctx, action) {
     return;
   }
   const oppIdx = 1 - myIdx;
-  const ease = squadEaseStrength(uid);
+  const ease = matchEaseCombined(uid);
   const result = resolveTurn(action, 0, ease);
   session.scores[myIdx] += result.you;
   session.scores[oppIdx] += result.them;
@@ -2220,15 +4231,20 @@ async function playTurnPvP(ctx, action) {
   }
 
   const nextNum = session.moveNum + 1;
-  await ctx.reply(
+  await postPvpMatchLiveBoard(
+    ctx.telegram,
+    session,
+    ctx.from.id,
     `${msg}\n\nХід передається <b>${nOtherHtml}</b> (наступний ${nextNum}/${session.maxTurns}).`,
-    { parse_mode: 'HTML' }
+    {}
   );
   try {
-    await ctx.telegram.sendMessage(
+    await postPvpMatchLiveBoard(
+      ctx.telegram,
+      session,
       pidOther,
       `${msg}\n\n⚡ <b>Твій хід</b> ${nextNum}/${session.maxTurns}`,
-      { parse_mode: 'HTML', ...pvpMoveKeyboard() }
+      { ...pvpMoveKeyboard() }
     );
   } catch {
     await ctx.reply(`Не вдалося написати ${nOtherHtml} — нехай відкриє чат із ботом.`, { parse_mode: 'HTML' });
@@ -2251,8 +4267,8 @@ async function playTurn(ctx, action) {
     return;
   }
 
-  const botStr = state.tournament?.strength ?? state.league?.strength ?? 0;
-  const ease = squadEaseStrength(userId);
+  const botStr = state.tournament?.strength ?? state.league?.strength ?? state.playerSeason?.strength ?? 0;
+  const ease = matchEaseCombined(userId);
   const result = resolveTurn(action, botStr, ease);
   state.you += result.you;
   state.them += result.them;
@@ -2270,6 +4286,7 @@ async function playTurn(ctx, action) {
     const regThem = state.them;
     const tour = state.tournament ? { ...state.tournament } : null;
     const leagueSnap = state.league ? { ...state.league, regYou, regThem } : null;
+    const psSnap = state.playerSeason ? { ...state.playerSeason, regYou, regThem } : null;
     fifaMatchByUser.delete(userId);
 
     if (draw) {
@@ -2279,6 +4296,7 @@ async function playTurn(ctx, action) {
         fromMatchDraw: true,
         tournamentMeta: tour,
         leagueMeta: leagueSnap,
+        playerSeasonMeta: psSnap,
       });
       return;
     }
@@ -2298,6 +4316,7 @@ async function playTurn(ctx, action) {
           }
           msg += `\n\n🏆 **Турнір завершено!** ${def.emoji} ${def.name}\n+${def.finalBonus + 10} 🪙 приз${trophyExtra}\nБаланс: **${getWallet(userId).coins}** 🪙`;
           await ctx.reply(msg, { parse_mode: 'Markdown' });
+          bumpCoachOrAgentAfterFriendly(userId, regYou, regThem, leagueSnap, psSnap);
           return;
         }
         tournamentProgressByUser.set(userId, { defId: tour.defId, stageIndex: nextIdx });
@@ -2305,6 +4324,7 @@ async function playTurn(ctx, action) {
         msg += `\n+етапні монети. Баланс: **${getWallet(userId).coins}** 🪙`;
         await ctx.reply(msg, { parse_mode: 'Markdown' });
         await beginTournamentRound(ctx, tour.defId, nextIdx);
+        bumpCoachOrAgentAfterFriendly(userId, regYou, regThem, leagueSnap, psSnap);
         return;
       }
       if (def && state.them > state.you) {
@@ -2314,6 +4334,7 @@ async function playTurn(ctx, action) {
         addCoins(userId, 5);
         msg += `\nБаланс: **${getWallet(userId).coins}** 🪙`;
         await ctx.reply(msg, { parse_mode: 'Markdown' });
+        bumpCoachOrAgentAfterFriendly(userId, regYou, regThem, leagueSnap, psSnap);
         return;
       }
     }
@@ -2325,13 +4346,33 @@ async function playTurn(ctx, action) {
       return;
     }
 
+    if (psSnap) {
+      msg += endMessage({ you: regYou, them: regThem });
+      await ctx.reply(msg, { parse_mode: 'Markdown' });
+      await finishPlayerCareerMatch(ctx, userId, regYou, regThem, psSnap);
+      return;
+    }
+
     msg += endMessage(state);
     awardAfterMatch(userId, state.you, state.them);
     msg += `\n\n+монети за матч (баланс: **${getWallet(userId).coins}** 🪙) — /shop /sklad`;
     await ctx.reply(msg, { parse_mode: 'Markdown' });
+    bumpCoachOrAgentAfterFriendly(userId, regYou, regThem, leagueSnap, psSnap);
   } else {
-    msg += `\nХід ${state.turn + 1}/${state.maxTurns} — обери кнопкою:`;
-    await ctx.reply(msg, fifaMoveKeyboard());
+    const cap =
+      `${escapeHtml(result.text)}\n` +
+      `Рахунок: <b>${escapeHtml(formatScore(state))}</b>. Хвилина ~${minuteLabel(state.turn)}.\n` +
+      `${escapeHtml(possessionLabel(state))}` +
+      `\nХід ${state.turn + 1}/${state.maxTurns} — обери кнопкою:`;
+    await postSoloMatchLiveBoard(
+      ctx,
+      state,
+      {
+        caption: cap,
+        parse_mode: 'HTML',
+        ...fifaMoveKeyboard(),
+      }
+    );
   }
 }
 
@@ -2597,7 +4638,6 @@ bot.catch((err, ctx) => {
   return ctx.reply('Сталася помилка. Спробуй ще раз або перезапусти бота.').catch(() => {});
 });
 
-void getMatchPhotoInput().catch(() => {});
 bot.launch();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
