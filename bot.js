@@ -213,6 +213,14 @@ function isAdminUser(from) {
   return false;
 }
 
+function isAdminUserId(userId) {
+  if (!adminConfigured()) return false;
+  if (ADMIN_NUMERIC_IDS.includes(userId)) return true;
+  const u = knownUsersById.get(userId);
+  if (u?.username && ADMIN_USERNAMES.includes(u.username.toLowerCase())) return true;
+  return false;
+}
+
 bot.use((ctx, next) => {
   if (ctx.from) rememberUser(ctx.from);
   return next();
@@ -666,7 +674,7 @@ const PLAYER_CAREER_CLUBS = [
 ];
 
 const CAREER_ICON_PLAYERS = [
-  { key: 'cp_m10', name: 'Ліонель Месі', baseOvr: 93, startAge: 24 },
+  { key: 'cp_m10', name: 'Ліонель Мессі', baseOvr: 93, startAge: 24 },
   { key: 'cp_cr7', name: 'Кріштіану Роналду', baseOvr: 92, startAge: 23 },
   { key: 'cp_neym', name: 'Неймар', baseOvr: 91, startAge: 22 },
   { key: 'cp_mbap', name: 'Кіліан Мбаппе', baseOvr: 92, startAge: 20 },
@@ -1288,9 +1296,9 @@ const SHOP_PLAYERS = [...SHOP_PLAYERS_STARS, ...SHOP_PLAYERS_LOCAL];
 
 /** Паки: один випадковий гравець з каталогу (лише ті, кого ще немає у складі). */
 const SHOP_PACKS = [
-  { id: 'pack_bronze', name: 'Бронзовий пак', price: 95 },
-  { id: 'pack_silver', name: 'Срібний пак', price: 210 },
-  { id: 'pack_gold', name: 'Золотий пак', price: 395 },
+  { id: 'pack_bronze', name: 'Бронзовий пак', price: 195 },
+  { id: 'pack_silver', name: 'Срібний пак', price: 460 },
+  { id: 'pack_gold', name: 'Золотий пак', price: 890 },
 ];
 
 function sleepMs(ms) {
@@ -1370,6 +1378,480 @@ function getWallet(userId) {
 function addCoins(userId, delta) {
   const w = getWallet(userId);
   w.coins = Math.max(0, w.coins + delta);
+}
+
+/** Щоденна цепочка: нескінченна серія; у панелі — лише 3 наступні дні; пропуск скидає на день 1. */
+/** @type {Map<number, { step: number, lastClaimKey: string | null }>} */
+const loginChainByUser = new Map();
+
+const LOGIN_CHAIN_BASE = [25, 45, 80];
+const LOGIN_CHAIN_PREVIEW_DAYS = 3;
+
+/** Нагорода для N-го дня серії (цикл 25/45/80 + бонус кожні 3 дні). */
+function loginChainRewardForDay(dayNum) {
+  const n = Math.max(1, Math.floor(dayNum));
+  const idx = (n - 1) % LOGIN_CHAIN_BASE.length;
+  const tier = Math.floor((n - 1) / LOGIN_CHAIN_BASE.length);
+  return LOGIN_CHAIN_BASE[idx] + tier * 20;
+}
+
+function calendarDateKey(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function yesterdayDateKey() {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return calendarDateKey(d);
+}
+
+/** Каталог цепочок: id = назва для /can (daily, vip, …). */
+const CHAIN_DEFS = {
+  daily: {
+    id: 'daily',
+    title: 'Щоденна цепочка',
+    emoji: '🔗',
+    access: 'public',
+  },
+  vip: {
+    id: 'vip',
+    title: 'VIP-цепочка',
+    emoji: '👑',
+    access: 'restricted',
+  },
+};
+
+const CHAIN_ORDER = ['daily', 'vip'];
+
+/** Дозволи на закриті цепочки (видає /can). */
+/** @type {Map<number, Set<string>>} */
+const chainGrantsByUser = new Map();
+
+function normalizeChainSlug(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_');
+}
+
+function resolveChainId(name) {
+  const slug = normalizeChainSlug(name);
+  if (CHAIN_DEFS[slug]) return slug;
+  const aliases = { щоденна: 'daily', daily_chain: 'daily', віп: 'vip', vip_chain: 'vip' };
+  if (aliases[slug]) return aliases[slug];
+  return null;
+}
+
+function getChainDef(chainId) {
+  const id = resolveChainId(chainId) || chainId;
+  return CHAIN_DEFS[id] || null;
+}
+
+function canUserClaimChain(userId, chainId) {
+  const id = resolveChainId(chainId) || chainId;
+  const def = CHAIN_DEFS[id];
+  if (!def) return false;
+  if (def.access === 'public') return true;
+  if (isAdminUserId(userId)) return true;
+  const grants = chainGrantsByUser.get(userId);
+  return Boolean(grants && grants.has(id));
+}
+
+function grantChainAccess(userId, chainId) {
+  const id = resolveChainId(chainId);
+  if (!id) return { ok: false, err: 'unknown_chain' };
+  const def = CHAIN_DEFS[id];
+  if (def.access === 'public') return { ok: false, err: 'already_public', chainId: id, title: def.title };
+  if (!chainGrantsByUser.has(userId)) chainGrantsByUser.set(userId, new Set());
+  chainGrantsByUser.get(userId).add(id);
+  return { ok: true, chainId: id, title: def.title };
+}
+
+function listChainsHelpHtml() {
+  return CHAIN_ORDER.map((id) => {
+    const d = CHAIN_DEFS[id];
+    const acc = d.access === 'public' ? 'відкрита' : 'закрита';
+    return `• <code>${id}</code> — ${d.title} (${acc})`;
+  }).join('\n');
+}
+
+function getLoginChainState(userId) {
+  if (!loginChainByUser.has(userId)) {
+    loginChainByUser.set(userId, { step: 0, lastClaimKey: null });
+  }
+  const st = loginChainByUser.get(userId);
+  if (st.step == null || st.step < 0) st.step = 0;
+  return st;
+}
+
+/** Номер дня, який можна (або буде) забрати наступним. */
+function loginChainNextClaimDay(userId) {
+  const st = getLoginChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+  if (st.lastClaimKey === today) return st.step + 1;
+  if (st.lastClaimKey == null) return 1;
+  if (st.lastClaimKey === yesterday) return st.step + 1;
+  return 1;
+}
+
+function loginChainProgressVisual(userId) {
+  const st = getLoginChainState(userId);
+  const claimedToday = st.lastClaimKey === calendarDateKey();
+  const startDay = loginChainNextClaimDay(userId);
+
+  const lines = [];
+  for (let i = 0; i < LOGIN_CHAIN_PREVIEW_DAYS; i += 1) {
+    const dayNum = startDay + i;
+    const coins = loginChainRewardForDay(dayNum);
+    let mark = '⬜';
+    if (i === 0 && !claimedToday) mark = '🎁';
+    else if (i === 0 && claimedToday) mark = '⏭';
+    lines.push(`${mark} <b>День ${dayNum}</b> — +${coins} 🪙`);
+  }
+  return lines.join('\n');
+}
+
+function loginChainStatusLine(userId) {
+  const st = getLoginChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+  const streakLine = st.step > 0 ? `Поточна серія: <b>${st.step}</b> дн. поспіль.` : '';
+
+  if (st.lastClaimKey === today) {
+    const next = st.step + 1;
+    const nextCoins = loginChainRewardForDay(next);
+    return (
+      `${streakLine}\n` +
+      `Сьогодні забрано <b>день ${st.step}</b>. Завтра — <b>день ${next}</b> (+${nextCoins} 🪙).`
+    ).trim();
+  }
+  if (st.step === 0 || st.lastClaimKey == null) {
+    return 'Серія не розпочата — натисни «Забрати нагороду» для <b>дня 1</b>.';
+  }
+  if (st.lastClaimKey === yesterday) {
+    const next = st.step + 1;
+    const coins = loginChainRewardForDay(next);
+    return (
+      `${streakLine}\n` +
+      `Сьогодні можна забрати <b>день ${next}</b> (+${coins} 🪙).`
+    ).trim();
+  }
+  return 'Пропущено день — серія скинулась. Сьогодні знову <b>день 1</b>.';
+}
+
+function tryClaimLoginChain(userId) {
+  getWallet(userId);
+  const st = getLoginChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+
+  if (st.lastClaimKey === today) {
+    return { ok: false, reason: 'already', step: st.step };
+  }
+
+  let reset = false;
+  if (st.lastClaimKey == null) {
+    st.step = 1;
+  } else if (st.lastClaimKey === yesterday) {
+    st.step += 1;
+  } else {
+    reset = true;
+    st.step = 1;
+  }
+
+  const coins = loginChainRewardForDay(st.step);
+  addCoins(userId, coins);
+  st.lastClaimKey = today;
+
+  return {
+    ok: true,
+    reset,
+    day: st.step,
+    coins,
+    step: st.step,
+  };
+}
+
+async function showLoginChainPanel(ctx) {
+  const uid = ctx.from.id;
+  getWallet(uid);
+  let body =
+    '<b>🔗 Цепочки нагород</b>\n\n' +
+    '<i>Кожна цепочка має <b>назву</b> (daily, vip…). Заходь щодня — серія без кінця; пропуск = день 1. Нижче — 3 наступні дні.</i>\n';
+  for (let i = 0; i < CHAIN_ORDER.length; i += 1) {
+    const chainId = CHAIN_ORDER[i];
+    if (i > 0) body += '\n— — —\n\n';
+    body += formatChainSectionHtml(uid, chainId);
+  }
+  const boostLine = adminBoostRemainingText(uid);
+  if (boostLine) body += `\n\n${boostLine}`;
+  body += `\n\nБаланс: <b>${getWallet(uid).coins}</b> 🪙`;
+  await ctx.reply(body, { parse_mode: 'HTML', ...chainPanelKeyboard(uid) });
+}
+
+function formatChainSectionHtml(userId, chainId) {
+  const def = CHAIN_DEFS[chainId];
+  if (!def) return '';
+  let accessLine = '';
+  if (def.access === 'restricted') {
+    accessLine = canUserClaimChain(userId, chainId)
+      ? ' <i>(доступ відкрито)</i>'
+      : ' 🔒 <i>(закрито — попроси власника: /can)</i>';
+  }
+  const visual = chainId === 'daily' ? loginChainProgressVisual(userId) : vipChainProgressVisual(userId);
+  const status = chainId === 'daily' ? loginChainStatusLine(userId) : vipChainStatusLine(userId);
+  const intro =
+    chainId === 'daily'
+      ? 'Монети щодня — чим довша серія, тим більше.'
+      : 'Окрема серія: гравець · монети · VIP-режим 15 хв.';
+  return (
+    `${def.emoji} <b>${def.title}</b> <code>${def.id}</code>${accessLine}\n` +
+    `<i>${intro}</i>\n\n${visual}\n\n${status}`
+  );
+}
+
+/** VIP-цепочка: окрема серія, видима всім; claim — admin або /can vip. */
+/** @type {Map<number, { step: number, lastClaimKey: string | null }>} */
+const vipChainByUser = new Map();
+
+/** Тимчасовий супер-бонус у матчах після VIP-нагороди (15 хв). */
+/** @type {Map<number, number>} */
+const adminMatchBoostByUser = new Map();
+
+const VIP_CHAIN_REWARD_CYCLE = [
+  { kind: 'player', label: '⭐ Новий гравець', preview: 'випадкова зірка у склад' },
+  { kind: 'coins', coins: 1500, label: '💰 1500 монет', preview: '+1500 🪙' },
+  { kind: 'admin_boost', minutes: 15, label: '🛡 VIP-режим 15 хв', preview: 'дуже легкі матчі 15 хв' },
+];
+
+function vipChainRewardForDay(dayNum) {
+  const n = Math.max(1, Math.floor(dayNum));
+  return VIP_CHAIN_REWARD_CYCLE[(n - 1) % VIP_CHAIN_REWARD_CYCLE.length];
+}
+
+function getVipChainState(userId) {
+  if (!vipChainByUser.has(userId)) {
+    vipChainByUser.set(userId, { step: 0, lastClaimKey: null });
+  }
+  const st = vipChainByUser.get(userId);
+  if (st.step == null || st.step < 0) st.step = 0;
+  return st;
+}
+
+function vipChainNextClaimDay(userId) {
+  const st = getVipChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+  if (st.lastClaimKey === today) return st.step + 1;
+  if (st.lastClaimKey == null) return 1;
+  if (st.lastClaimKey === yesterday) return st.step + 1;
+  return 1;
+}
+
+function vipChainProgressVisual(userId) {
+  const st = getVipChainState(userId);
+  const claimedToday = st.lastClaimKey === calendarDateKey();
+  const startDay = vipChainNextClaimDay(userId);
+  const lines = [];
+  for (let i = 0; i < LOGIN_CHAIN_PREVIEW_DAYS; i += 1) {
+    const dayNum = startDay + i;
+    const reward = vipChainRewardForDay(dayNum);
+    let mark = '⬜';
+    if (i === 0 && !claimedToday) mark = canUserClaimChain(userId, 'vip') ? '🎁' : '🔒';
+    else if (i === 0 && claimedToday) mark = '⏭';
+    lines.push(`${mark} <b>День ${dayNum}</b> — ${reward.label} <i>(${reward.preview})</i>`);
+  }
+  return lines.join('\n');
+}
+
+function vipChainStatusLine(userId) {
+  const st = getVipChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+  if (!canUserClaimChain(userId, 'vip')) {
+    return '<i>Закрито. Доступ — власник бота або команда /can від нього.</i>';
+  }
+  const streakLine = st.step > 0 ? `VIP-серія: <b>${st.step}</b> дн.` : '';
+  if (st.lastClaimKey === today) {
+    const next = st.step + 1;
+    const reward = vipChainRewardForDay(next);
+    return `${streakLine}\nСьогодні VIP забрано (<b>день ${st.step}</b>). Завтра — <b>${reward.label}</b>.`.trim();
+  }
+  if (st.step === 0 || st.lastClaimKey == null) {
+    return 'VIP-серія не розпочата — «👑 VIP нагорода».';
+  }
+  if (st.lastClaimKey === yesterday) {
+    const next = st.step + 1;
+    const reward = vipChainRewardForDay(next);
+    return `${streakLine}\nСьогодні VIP: <b>${reward.label}</b>.`.trim();
+  }
+  return 'VIP: пропущено день — знову з <b>дня 1</b>.';
+}
+
+function adminMatchBoostActive(userId) {
+  const exp = adminMatchBoostByUser.get(userId);
+  if (!exp) return false;
+  if (Date.now() >= exp) {
+    adminMatchBoostByUser.delete(userId);
+    return false;
+  }
+  return true;
+}
+
+function adminBoostRemainingText(userId) {
+  const exp = adminMatchBoostByUser.get(userId);
+  if (!exp || Date.now() >= exp) return null;
+  const min = Math.max(1, Math.ceil((exp - Date.now()) / 60000));
+  return `<b>🛡 VIP-режим</b> активний ще ~<b>${min}</b> хв — матчі проти бота набагато легші.`;
+}
+
+function pickVipChainPlayerId(userId) {
+  const unowned = getUnownedShopPlayerIds(userId);
+  if (!unowned.length) return null;
+  const stars = unowned.filter((id) => SHOP_PLAYERS_STARS.some((p) => p.id === id));
+  const pool = stars.length ? stars : unowned;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function applyVipChainReward(userId, dayNum) {
+  const reward = vipChainRewardForDay(dayNum);
+  if (reward.kind === 'coins') {
+    addCoins(userId, reward.coins);
+    return { kind: 'coins', text: `+<b>${reward.coins}</b> 🪙`, label: reward.label };
+  }
+  if (reward.kind === 'player') {
+    const pid = pickVipChainPlayerId(userId);
+    if (!pid) {
+      const fallback = 600;
+      addCoins(userId, fallback);
+      return {
+        kind: 'coins',
+        text: `Усі гравці вже є — компенсація <b>+${fallback}</b> 🪙`,
+        label: reward.label,
+      };
+    }
+    addPlayerToSquad(userId, pid);
+    const meta = getPlayerMeta(pid);
+    return {
+      kind: 'player',
+      text: `<b>${escapeHtml(meta.name)}</b> · ${meta.rating} OVR у склад`,
+      label: reward.label,
+    };
+  }
+  if (reward.kind === 'admin_boost') {
+    const ms = (reward.minutes || 15) * 60 * 1000;
+    adminMatchBoostByUser.set(userId, Date.now() + ms);
+    return {
+      kind: 'admin_boost',
+      text: `<b>VIP-режим ${reward.minutes} хв</b> — суперлегкі матчі та турніри`,
+      label: reward.label,
+    };
+  }
+  return { kind: 'unknown', text: 'нагорода', label: '?' };
+}
+
+function tryClaimVipChain(userId) {
+  if (!canUserClaimChain(userId, 'vip')) {
+    return { ok: false, reason: 'locked' };
+  }
+  getWallet(userId);
+  const st = getVipChainState(userId);
+  const today = calendarDateKey();
+  const yesterday = yesterdayDateKey();
+  if (st.lastClaimKey === today) {
+    return { ok: false, reason: 'already', step: st.step };
+  }
+  let reset = false;
+  if (st.lastClaimKey == null) {
+    st.step = 1;
+  } else if (st.lastClaimKey === yesterday) {
+    st.step += 1;
+  } else {
+    reset = true;
+    st.step = 1;
+  }
+  const applied = applyVipChainReward(userId, st.step);
+  st.lastClaimKey = today;
+  return {
+    ok: true,
+    reset,
+    day: st.step,
+    step: st.step,
+    applied,
+  };
+}
+
+function chainPanelKeyboard(userId) {
+  const today = calendarDateKey();
+  const rows = [];
+  for (const chainId of CHAIN_ORDER) {
+    const def = CHAIN_DEFS[chainId];
+    const st = chainId === 'daily' ? getLoginChainState(userId) : getVipChainState(userId);
+    const claimedToday = st.lastClaimKey === today;
+    if (chainId === 'daily') {
+      if (!claimedToday) {
+        rows.push([Markup.button.callback(`🎁 ${def.title}`, 'chain:claim:daily')]);
+      }
+      continue;
+    }
+    if (canUserClaimChain(userId, chainId)) {
+      if (!claimedToday) {
+        rows.push([Markup.button.callback(`${def.emoji} ${def.title}`, `chain:claim:${chainId}`)]);
+      }
+    } else {
+      rows.push([Markup.button.callback(`🔒 ${def.title}`, `chain:locked:${chainId}`)]);
+    }
+  }
+  rows.push([Markup.button.callback('🔙 Закрити', 'chain:close')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function loginChainKeyboard(userId) {
+  return chainPanelKeyboard(userId);
+}
+
+async function handleChainClaim(ctx, chainName) {
+  const uid = ctx.from.id;
+  const chainId = resolveChainId(chainName);
+  if (!chainId) {
+    await ctx.reply('Невідома цепочка. Доступні: daily, vip.');
+    return;
+  }
+  if (!canUserClaimChain(uid, chainId)) {
+    const def = CHAIN_DEFS[chainId];
+    await ctx.reply(
+      `🔒 Цепочка <b>${def.title}</b> (<code>${chainId}</code>) закрита. Попроси власника: <code>/can @username ${chainId}</code>.`,
+      { parse_mode: 'HTML', ...chainPanelKeyboard(uid) }
+    );
+    return;
+  }
+  const result = chainId === 'daily' ? tryClaimLoginChain(uid) : tryClaimVipChain(uid);
+  if (!result.ok) {
+    if (result.reason === 'already') {
+      const def = CHAIN_DEFS[chainId];
+      await ctx.reply(`Нагороду «${def.title}» сьогодні вже забрано. Завтра — наступний день.`, {
+        parse_mode: 'HTML',
+        ...chainPanelKeyboard(uid),
+      });
+    }
+    return;
+  }
+  let extra = '';
+  if (result.reset) extra = '\n<i>Серію перервано — знову з дня 1.</i>';
+  if (chainId === 'daily') {
+    await ctx.reply(
+      `<b>🎁 ${CHAIN_DEFS.daily.title} · день ${result.day}:</b> +<b>${result.coins}</b> 🪙${extra}\n` +
+        `Серія: <b>${result.step}</b> дн. · баланс: <b>${getWallet(uid).coins}</b> 🪙`,
+      { parse_mode: 'HTML', ...chainPanelKeyboard(uid) }
+    );
+    return;
+  }
+  await ctx.reply(
+    `<b>${CHAIN_DEFS.vip.emoji} ${CHAIN_DEFS.vip.title} · день ${result.day}:</b> ${result.applied.label}\n${result.applied.text}${extra}\n` +
+      `VIP-серія: <b>${result.step}</b> дн. · баланс: <b>${getWallet(uid).coins}</b> 🪙`,
+    { parse_mode: 'HTML', ...chainPanelKeyboard(uid) }
+  );
 }
 
 function addInventory(userId, itemId, qty = 1) {
@@ -1524,6 +2006,7 @@ function matchEaseCombined(userId) {
   let ease = Math.max(squadEaseStrength(userId), careerProEaseFromCareer(userId));
   if (getCareerMode(userId) === 'coach') ease += coachEaseFromState(userId);
   if (getCareerMode(userId) === 'agent') ease += agentEaseFromState(userId);
+  if (adminMatchBoostActive(userId)) ease += 0.095;
   return ease;
 }
 
@@ -2006,6 +2489,7 @@ function mainMenuKeyboard(userId) {
     [Markup.button.callback('📊 Чемпіонат (ліга)', 'league:menu')],
     [Markup.button.callback('🎧 Офіс тренера', 'coach:menu')],
     [Markup.button.callback('🤝 Офіс агента', 'agent:menu')],
+    [Markup.button.callback('🔗 Цепочка нагород', 'chain:menu')],
     [
       Markup.button.callback('🥅 Пенальті', 'pen:new'),
       Markup.button.callback('🛒 Магазин', 'shop:open'),
@@ -2026,6 +2510,7 @@ function bottomMenuReplyKeyboard(opts = {}) {
     ['▶️ Матч', '🏆 Турнір'],
     ['📊 Чемпіонат', '🎧 Тренер'],
     ['🤝 Агент'],
+    ['🔗 Цепочка'],
     ['🛒 Магазин', '👥 Склад'],
     ['🥅 Пенальті'],
   ];
@@ -3010,6 +3495,7 @@ bot.start(async (ctx) => {
     '**Пенальті:** /penalty\n' +
     '**Магазин:** /shop (паки й сувеніри) · **Склад:** /sklad\n' +
     '**Турнір:** «🏆 Турнір» знизу, інлайн або /tournament\n' +
+    '**Цепочка:** «🔗 Цепочка» — daily (усім) та vip (закрита; доступ — /can). Адмін: <code>/can username vip</code>\n' +
     '**Чемпіонат / карʼєра:** «📊 Чемпіонат» або /championship — клуб (ліга), гравець (20 сезонів), **тренер** або **агент** (офіси через меню знизу): перемикання **/swap** (клуб → гравець → тренер → агент)\n' +
     'Зупинити: /fifa_stop, /penalty_stop, /tournament_stop, /league_stop (ліга чи карʼєра гравця залежно від режиму)\n\n' +
     'Захист у матчі: «Відбір», «Блок», «Пресинг» або /tackle, /block, /mark.\n\n' +
@@ -3058,6 +3544,10 @@ bot.hears(/^🤝 Агент$/, async (ctx) => {
   await openAgentOfficeOrHint(ctx);
 });
 
+bot.hears(/^🔗 Цепочка$/, async (ctx) => {
+  await showLoginChainPanel(ctx);
+});
+
 bot.hears(/^🛒 Магазин$/, async (ctx) => {
   getWallet(ctx.from.id);
   const w = getWallet(ctx.from.id);
@@ -3090,6 +3580,51 @@ bot.hears(/^🔄 Обмін гравцями$/, async (ctx) => {
 });
 
 bot.command('fifa', (ctx) => handleFifaStart(ctx));
+
+bot.command('chain', async (ctx) => {
+  await showLoginChainPanel(ctx);
+});
+
+bot.action('chain:menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  await showLoginChainPanel(ctx);
+});
+
+bot.action('chain:claim', async (ctx) => {
+  await ctx.answerCbQuery();
+  await handleChainClaim(ctx, 'daily');
+});
+
+bot.action(/^chain:claim:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await handleChainClaim(ctx, ctx.match[1]);
+});
+
+bot.action('chain:close', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply('Готово. Цепочки — «🔗 Цепочка» або кнопка в меню.');
+});
+
+bot.action(/^chain:locked:(\w+)$/, async (ctx) => {
+  const chainId = resolveChainId(ctx.match[1]);
+  const title = chainId ? CHAIN_DEFS[chainId]?.title : 'Цепочка';
+  await ctx.answerCbQuery({
+    text: `🔒 ${title} закрита — доступ через /can від власника`,
+    show_alert: true,
+  });
+});
+
+bot.action('vipchain:locked', async (ctx) => {
+  await ctx.answerCbQuery({
+    text: '🔒 VIP-цепочка закрита — доступ через /can vip від власника',
+    show_alert: true,
+  });
+});
+
+bot.action('vipchain:claim', async (ctx) => {
+  await ctx.answerCbQuery();
+  await handleChainClaim(ctx, 'vip');
+});
 
 bot.action('fifa:new', async (ctx) => {
   await ctx.answerCbQuery();
@@ -4521,6 +5056,66 @@ bot.command('transfer', async (ctx) => {
       ? `Обмін **увімкнено**. Клавіатуру оновлено: доставлено ${ok}, не вдалося ${fail}.`
       : `Обмін **вимкнено**. Клавіатуру оновлено: ${ok}, не вдалося ${fail}.`
   );
+});
+
+bot.command('can', async (ctx) => {
+  if (!isAdminUser(ctx.from)) return;
+  if (!adminConfigured()) {
+    await ctx.reply('У .env не задано ADMIN_ID.');
+    return;
+  }
+  const rest = (ctx.message?.text || '')
+    .replace(/^\/can(@[A-Za-z0-9_]+)?\s*/i, '')
+    .trim();
+  const parts = rest.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) {
+    await ctx.reply(
+      'Формат: <code>/can username назва_цепочки</code>\n' +
+        'Приклад: <code>/can Max_Misiura vip</code>\n\n' +
+        '<b>Цепочки:</b>\n' +
+        listChainsHelpHtml(),
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  const target = resolvePvpTargetToken(parts[0]);
+  if (target.err) {
+    await ctx.reply(`Не знайдено користувача: ${target.err}`);
+    return;
+  }
+  const chainId = resolveChainId(parts[1]);
+  if (!chainId) {
+    await ctx.reply(
+      `Невідома цепочка «${escapeHtml(parts[1])}».\n\n<b>Доступні назви:</b>\n${listChainsHelpHtml()}`,
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  const grant = grantChainAccess(target.id, chainId);
+  if (!grant.ok) {
+    if (grant.err === 'already_public') {
+      await ctx.reply(`Цепочка <b>${grant.title}</b> (<code>${grant.chainId}</code>) і так відкрита для всіх.`, {
+        parse_mode: 'HTML',
+      });
+      return;
+    }
+    await ctx.reply('Помилка видачі доступу.');
+    return;
+  }
+  const label = formatPlayerLabel(target.id);
+  await ctx.reply(
+    `✅ <b>${escapeHtml(label)}</b> (id <code>${target.id}</code>) отримав доступ до цепочки <b>${grant.title}</b> (<code>${grant.chainId}</code>).`,
+    { parse_mode: 'HTML' }
+  );
+  try {
+    await ctx.telegram.sendMessage(
+      target.id,
+      `🎁 Власник бота відкрив тобі цепочку <b>${grant.title}</b> (<code>${grant.chainId}</code>).\nВідкрий «🔗 Цепочка» у меню.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch {
+    /* ignore */
+  }
 });
 
 bot.command('add', async (ctx) => {
